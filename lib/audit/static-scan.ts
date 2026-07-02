@@ -87,7 +87,7 @@ export function scanStaticHtml(html: string, targetUrl: URL): StaticAuditReport 
   const hasBackendEndpoint = hasPostForm || hasFormActionEndpoint || hasServerScriptSignal;
   const usesLocalStorage = signals.localStorage || signals.sessionStorage || signals.indexedDB;
   const usesSupabaseOrFirebase = signals.supabase || signals.firebase || signals.firestore;
-  const verdict = classifyStatic({ hasForm, hasBackendEndpoint, usesLocalStorage });
+  const verdict = classifyStatic({ hasBackendEndpoint });
 
   return {
     targetUrl: targetUrl.toString(),
@@ -115,39 +115,23 @@ function detectSignals(html: string) {
 }
 
 function classifyStatic({
-  hasForm,
   hasBackendEndpoint,
-  usesLocalStorage,
 }: {
-  hasForm: boolean;
   hasBackendEndpoint: boolean;
-  usesLocalStorage: boolean;
 }): StaticVerdict {
   if (hasBackendEndpoint) {
     return "BACKEND_ENDPOINT_FOUND";
   }
 
-  if (hasForm && usesLocalStorage) {
-    return "LOCAL_ONLY";
-  }
-
-  if (!hasForm && !usesLocalStorage) {
-    return "NO_SUBMISSION_DETECTED_OR_FAKE_UI";
-  }
-
-  return "UNKNOWN";
+  return "NO_DATA_SENT";
 }
 
 function buildSummary(verdict: StaticVerdict) {
   switch (verdict) {
     case "BACKEND_ENDPOINT_FOUND":
       return "Static scan found a form action or JavaScript/server-service submission signal.";
-    case "LOCAL_ONLY":
-      return "Static scan found a form and browser storage signals, but no clear backend submission signal.";
-    case "NO_SUBMISSION_DETECTED_OR_FAKE_UI":
-      return "Static scan did not find a form or meaningful submission/storage signal.";
     default:
-      return "Static scan found partial signals, but not enough to classify confidently.";
+      return "Static scan did not find a server submission endpoint.";
   }
 }
 

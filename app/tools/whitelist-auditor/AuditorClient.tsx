@@ -6,6 +6,7 @@ import {
   DUMMY_NAME,
   DUMMY_TWITTER,
   DUMMY_WALLET,
+  LIVE_AUDIT_RATE_LIMIT,
   type LiveAuditReport,
 } from "@/lib/audit/types";
 
@@ -54,8 +55,8 @@ export default function AuditorClient() {
             Whitelist / Waitlist Form Auditor
           </h1>
           <p className="mt-3 text-sm leading-6 text-zinc-600 sm:text-base">
-            Paste website whitelist atau waitlist. Tool ini akan isi data dummy, klik submit, lalu
-            cek apakah data benar-benar keluar dari browser ke server.
+            Paste website whitelist atau waitlist. Tool ini isi data dummy, klik submit, lalu jawab
+            sederhana: YES kalau dummy data terkirim ke server, NO kalau tidak terkirim.
           </p>
         </header>
 
@@ -92,6 +93,9 @@ export default function AuditorClient() {
             Email dummy: <span className="font-mono text-zinc-900">{DUMMY_EMAIL}</span>
             <br />
             Nama dummy: <span className="font-mono text-zinc-900">{DUMMY_NAME}</span>
+            <br />
+            Rate limit:{" "}
+            <span className="font-medium text-zinc-900">{LIVE_AUDIT_RATE_LIMIT.label}</span>
           </div>
 
           {error ? (
@@ -103,47 +107,43 @@ export default function AuditorClient() {
 
         {report ? (
           <section className={`rounded border p-5 shadow-sm ${result.className}`}>
-            <p className="text-sm font-medium uppercase tracking-[0.14em] opacity-75">Hasil</p>
-            <h2 className="mt-3 text-2xl font-semibold leading-8">{result.title}</h2>
+            <p className="text-sm font-medium uppercase tracking-[0.14em] opacity-75">Result</p>
+            <h2 className="mt-3 text-3xl font-semibold leading-9">{result.title}</h2>
             <p className="mt-3 text-sm leading-6">{result.description}</p>
           </section>
         ) : null}
 
         {report ? (
           <section className="rounded border border-zinc-200 bg-white p-4 shadow-sm">
-            <h2 className="text-lg font-semibold">Bukti singkat</h2>
+            <h2 className="text-lg font-semibold">Ringkasan metrik</h2>
             <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2">
-              <Fact label="Tombol submit berhasil diklik" value={report.submitClicked} />
               <Fact label="Request membawa data dummy" value={report.payloadContainsDummyData} />
               <Fact label="Ada request POST/PUT/PATCH" value={report.hasPostRequest} />
-              <Fact label="Data dummy tersimpan di browser" value={report.storageContainsDummyData} />
+              <Fact label="Tombol submit berhasil diklik" value={report.submitClicked} />
+              <Fact label="Data dummy hanya tersimpan di browser" value={report.storageContainsDummyData} />
             </dl>
 
-            <div className="mt-5 rounded border border-sky-200 bg-sky-50 px-3 py-3 text-sm leading-6 text-sky-950">
-              <h3 className="font-semibold">Cara verifikasi hasil</h3>
-              <ol className="mt-2 list-decimal space-y-1 pl-5">
-                <li>
-                  Kalau <strong>Request membawa data dummy = Ya</strong>, berarti data form benar
-                  keluar dari browser ke endpoint server.
-                </li>
-                <li>
-                  Kalau ada endpoint di bawah, itu alamat server yang menerima request saat tombol
-                  submit diklik.
-                </li>
-                <li>
-                  Kalau <strong>Data dummy tersimpan di browser = Ya</strong> tapi request dummy
-                  tidak ada, form hanya menyimpan data lokal di browser.
-                </li>
-                <li>
-                  Kalau semuanya <strong>Tidak</strong>, submit tidak mengirim data yang bisa
-                  terdeteksi oleh tool ini.
-                </li>
-              </ol>
+            <div className="mt-5 grid gap-3 text-sm">
+              <InfoRow title="Metric utama">
+                YES hanya kalau dummy wallet, email, nama, atau X/Twitter muncul di payload request
+                POST/PUT/PATCH.
+              </InfoRow>
+              <InfoRow title="Metric NO">
+                NO kalau dummy data tidak muncul di request server, termasuk saat hanya tersimpan di
+                browser storage atau submit tidak jalan.
+              </InfoRow>
+              <InfoRow title="Database">
+                Dari luar, database tidak bisa dicek langsung. Request ke server dianggap jalur normal
+                menuju database.
+              </InfoRow>
+              <InfoRow title="Rate limit">
+                {report.rateLimit.label}. Sisa request window ini: {report.rateLimit.remaining}.
+              </InfoRow>
             </div>
 
             {report.requests.length > 0 ? (
               <div className="mt-5">
-                <h3 className="text-sm font-semibold text-zinc-800">Result detail</h3>
+                <h3 className="text-sm font-semibold text-zinc-800">Request detail</h3>
                 <div className="mt-2 space-y-2">
                   {report.requests.slice(0, 5).map((request) => (
                     <div
@@ -161,7 +161,7 @@ export default function AuditorClient() {
                       {request.postDataPreview ? (
                         <details className="mt-2 rounded border border-zinc-200 bg-white">
                           <summary className="cursor-pointer px-2 py-1 font-medium text-zinc-800">
-                            Lihat payload preview
+                            Payload preview
                           </summary>
                           <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all border-t border-zinc-200 p-2 text-[11px] leading-5 text-zinc-700">
                             {request.postDataPreview}
@@ -204,46 +204,29 @@ function Fact({ label, value }: { label: string; value: boolean }) {
   );
 }
 
+function InfoRow({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="rounded border border-zinc-200 bg-zinc-50 px-3 py-2">
+      <h3 className="font-semibold text-zinc-900">{title}</h3>
+      <p className="mt-1 leading-6 text-zinc-600">{children}</p>
+    </div>
+  );
+}
+
 function getSimpleResult(report: LiveAuditReport | null) {
-  if (!report) {
+  if (!report || report.result === "NO") {
     return {
-      title: "Belum dicek",
-      description: "",
-      className: "border-zinc-200 bg-white text-zinc-900",
-    };
-  }
-
-  if (report.verdict === "DATA_SENT_TO_SERVER") {
-    return {
-      title: "Data dummy terkirim ke server",
+      title: "NO - data tidak terkirim",
       description:
-        "Saat form dites, data dummy masuk ke request POST/PUT/PATCH. Dari luar kita bisa membuktikan data keluar ke server. Penyimpanan ke database tetap butuh akses backend untuk dibuktikan penuh.",
-      className: "border-emerald-200 bg-emerald-50 text-emerald-900",
-    };
-  }
-
-  if (report.verdict === "LOCAL_ONLY") {
-    return {
-      title: "Data tidak terkirim ke server",
-      description:
-        "Data dummy hanya tertulis di storage browser. Tidak ada request pengiriman data dummy ke server yang tertangkap.",
-      className: "border-amber-200 bg-amber-50 text-amber-900",
-    };
-  }
-
-  if (report.verdict === "NO_SUBMISSION_DETECTED_OR_FAKE_UI") {
-    return {
-      title: "Data tidak terkirim ke mana-mana",
-      description:
-        "Form berhasil dites, tapi tidak ada request pengiriman data dummy dan tidak ada penyimpanan data dummy di browser. Ini bisa berarti UI hanya pajangan, submit tidak jalan, atau form butuh langkah manual tambahan.",
+        "Dummy data tidak ditemukan di request ke server. Dalam test ini form dianggap tidak bekerja sebagai form database/server.",
       className: "border-red-200 bg-red-50 text-red-900",
     };
   }
 
   return {
-    title: "Belum bisa dibuktikan otomatis",
+    title: "YES - form works",
     description:
-      "Tool tidak berhasil mengisi input atau klik submit dengan aman. Coba cek manual, terutama kalau website meminta connect wallet, captcha, atau sign message.",
-    className: "border-zinc-200 bg-white text-zinc-900",
+      "Dummy data ditemukan di request POST/PUT/PATCH ke server. Ini berarti form mengirim data keluar dari browser.",
+    className: "border-emerald-200 bg-emerald-50 text-emerald-900",
   };
 }

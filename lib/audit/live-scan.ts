@@ -1,4 +1,4 @@
-import type { Page } from "playwright";
+import type { Browser, Page } from "playwright-core";
 import {
   DUMMY_EMAIL,
   DUMMY_NAME,
@@ -16,12 +16,11 @@ const MAX_CAPTURED_REQUESTS = 25;
 const DUMMY_VALUES = [DUMMY_WALLET, DUMMY_TWITTER, DUMMY_EMAIL, DUMMY_NAME];
 
 export async function runLiveAudit(targetUrl: URL): Promise<LiveAuditReport> {
-  const { chromium } = await import("playwright");
   const startedAt = Date.now();
   const requests: CapturedRequest[] = [];
   const notes: string[] = [];
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchAuditBrowser();
 
   try {
     const context = await browser.newContext({
@@ -138,8 +137,12 @@ export async function runLiveAudit(targetUrl: URL): Promise<LiveAuditReport> {
     const usesLocalStorage = storageEvents.some((event) => event.area === "localStorage");
     const storageContainsDummyData = storageEvents.some((event) => event.containsDummyData);
     const verdict = classifyLive({
-      hasPostRequest,
       payloadContainsDummyData,
+    });
+    const result = verdict === "DATA_SENT_TO_SERVER" ? "YES" : "NO";
+    const reason = buildReason({
+      payloadContainsDummyData,
+      hasPostRequest,
       storageContainsDummyData,
       filledAnyInput:
         fillResult.walletFilled ||
@@ -170,11 +173,39 @@ export async function runLiveAudit(targetUrl: URL): Promise<LiveAuditReport> {
       nameFilled: fillResult.nameFilled,
       submitClicked,
       verdict,
+      result,
+      reason,
+      rateLimit: {
+        limit: 0,
+        remaining: 0,
+        windowMs: 0,
+        label: "",
+        resetAt: "",
+      },
       notes,
     };
   } finally {
     await browser.close();
   }
+}
+
+async function launchAuditBrowser(): Promise<Browser> {
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    const [{ chromium: playwrightChromium }, serverlessChromium] = await Promise.all([
+      import("playwright-core"),
+      import("@sparticuz/chromium"),
+    ]);
+    const chromium = serverlessChromium.default;
+
+    return playwrightChromium.launch({
+      args: chromium.args,
+      executablePath: await chromium.executablePath(),
+      headless: true,
+    });
+  }
+
+  const { chromium } = await import("playwright");
+  return chromium.launch({ headless: true });
 }
 
 async function fillTargetInputs(page: Page) {
@@ -334,31 +365,47 @@ async function clickSubmitButton(page: Page) {
 }
 
 function classifyLive({
-  hasPostRequest,
   payloadContainsDummyData,
+}: {
+  payloadContainsDummyData: boolean;
+}): LiveVerdict {
+  if (payloadContainsDummyData) {
+    return "DATA_SENT_TO_SERVER";
+  }
+
+  return "NO_DATA_SENT";
+}
+
+function buildReason({
+  payloadContainsDummyData,
+  hasPostRequest,
   storageContainsDummyData,
   filledAnyInput,
   submitClicked,
 }: {
-  hasPostRequest: boolean;
   payloadContainsDummyData: boolean;
+  hasPostRequest: boolean;
   storageContainsDummyData: boolean;
   filledAnyInput: boolean;
   submitClicked: boolean;
-}): LiveVerdict {
-  if (hasPostRequest && payloadContainsDummyData) {
-    return "DATA_SENT_TO_SERVER";
+}) {
+  if (payloadContainsDummyData) {
+    return "Dummy data was found inside a POST/PUT/PATCH request payload.";
+  }
+
+  if (hasPostRequest) {
+    return "The page made a POST/PUT/PATCH request, but the dummy form data was not inside that payload.";
   }
 
   if (storageContainsDummyData) {
-    return "LOCAL_ONLY";
+    return "Dummy data was only written to browser storage, not sent in a server request.";
   }
 
   if (filledAnyInput && submitClicked) {
-    return "NO_SUBMISSION_DETECTED_OR_FAKE_UI";
+    return "Inputs were filled and submit was clicked, but no server request carried the dummy data.";
   }
 
-  return "UNKNOWN";
+  return "The tool could not safely fill and submit the form, so no dummy data was sent during this test.";
 }
 
 function fieldText(field: {

@@ -2,13 +2,18 @@ import { NextResponse } from "next/server";
 import { consumeRateLimit, getClientKey } from "@/lib/audit/rate-limit";
 import { fetchTargetHtml, UrlValidationError, validatePublicTargetUrl } from "@/lib/audit/security";
 import { scanStaticHtml } from "@/lib/audit/static-scan";
+import { STATIC_AUDIT_RATE_LIMIT } from "@/lib/audit/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 15;
 
 export async function POST(request: Request) {
-  const rate = consumeRateLimit(`static:${getClientKey(request)}`, 12, 60_000);
+  const rate = consumeRateLimit(
+    `static:${getClientKey(request)}`,
+    STATIC_AUDIT_RATE_LIMIT.limit,
+    STATIC_AUDIT_RATE_LIMIT.windowMs,
+  );
   if (!rate.allowed) {
     return NextResponse.json(
       { error: "Rate limit reached. Wait a minute before scanning again." },

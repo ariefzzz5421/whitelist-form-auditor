@@ -3,6 +3,18 @@ export const DUMMY_TWITTER = "test_audit_123456";
 export const DUMMY_EMAIL = "audit_waitlist_123456@example.com";
 export const DUMMY_NAME = "Audit Test User";
 
+export const LIVE_AUDIT_RATE_LIMIT = {
+  limit: 4,
+  windowMs: 5 * 60_000,
+  label: "4 checks per 5 minutes per IP",
+} as const;
+
+export const STATIC_AUDIT_RATE_LIMIT = {
+  limit: 12,
+  windowMs: 60_000,
+  label: "12 checks per minute per IP",
+} as const;
+
 export const SIGNAL_KEYS = [
   "fetch",
   "XMLHttpRequest",
@@ -23,15 +35,11 @@ export type SignalName = (typeof SIGNAL_KEYS)[number];
 
 export type StaticVerdict =
   | "BACKEND_ENDPOINT_FOUND"
-  | "LOCAL_ONLY"
-  | "NO_SUBMISSION_DETECTED_OR_FAKE_UI"
-  | "UNKNOWN";
+  | "NO_DATA_SENT";
 
 export type LiveVerdict =
   | "DATA_SENT_TO_SERVER"
-  | "LOCAL_ONLY"
-  | "NO_SUBMISSION_DETECTED_OR_FAKE_UI"
-  | "UNKNOWN";
+  | "NO_DATA_SENT";
 
 export type DetectionSignals = Record<SignalName, boolean>;
 
@@ -92,6 +100,14 @@ export interface StorageEventCapture {
   timestamp: number;
 }
 
+export interface RateLimitInfo {
+  limit: number;
+  remaining: number;
+  windowMs: number;
+  label: string;
+  resetAt: string;
+}
+
 export interface LiveAuditReport {
   targetUrl: string;
   scannedAt: string;
@@ -111,5 +127,8 @@ export interface LiveAuditReport {
   nameFilled: boolean;
   submitClicked: boolean;
   verdict: LiveVerdict;
+  result: "YES" | "NO";
+  reason: string;
+  rateLimit: RateLimitInfo;
   notes: string[];
 }
