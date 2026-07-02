@@ -1,5 +1,7 @@
 export const DUMMY_WALLET = "0x000000000000000000000000000000000000dEaD";
 export const DUMMY_TWITTER = "test_audit_123456";
+export const DUMMY_EMAIL = "audit_waitlist_123456@example.com";
+export const DUMMY_NAME = "Audit Test User";
 
 export const SIGNAL_KEYS = [
   "fetch",
@@ -72,6 +74,9 @@ export interface CapturedRequest {
   postDataPreview: string;
   containsDummyWallet: boolean;
   containsDummyTwitter: boolean;
+  containsDummyEmail: boolean;
+  containsDummyName: boolean;
+  containsDummyData: boolean;
   timestamp: string;
 }
 
@@ -81,6 +86,9 @@ export interface StorageEventCapture {
   valuePreview: string;
   containsDummyWallet: boolean;
   containsDummyTwitter: boolean;
+  containsDummyEmail: boolean;
+  containsDummyName: boolean;
+  containsDummyData: boolean;
   timestamp: number;
 }
 
@@ -92,9 +100,15 @@ export interface LiveAuditReport {
   hasPostRequest: boolean;
   payloadContainsDummyWallet: boolean;
   payloadContainsDummyTwitter: boolean;
+  payloadContainsDummyEmail: boolean;
+  payloadContainsDummyName: boolean;
+  payloadContainsDummyData: boolean;
+  storageContainsDummyData: boolean;
   usesLocalStorage: boolean;
   walletFilled: boolean;
   twitterFilled: boolean;
+  emailFilled: boolean;
+  nameFilled: boolean;
   submitClicked: boolean;
   verdict: LiveVerdict;
   notes: string[];

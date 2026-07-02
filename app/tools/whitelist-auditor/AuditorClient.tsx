@@ -1,7 +1,13 @@
 "use client";
 
 import { FormEvent, useMemo, useState } from "react";
-import { DUMMY_TWITTER, DUMMY_WALLET, type LiveAuditReport } from "@/lib/audit/types";
+import {
+  DUMMY_EMAIL,
+  DUMMY_NAME,
+  DUMMY_TWITTER,
+  DUMMY_WALLET,
+  type LiveAuditReport,
+} from "@/lib/audit/types";
 
 export default function AuditorClient() {
   const [targetUrl, setTargetUrl] = useState("");
@@ -44,10 +50,12 @@ export default function AuditorClient() {
           <p className="text-sm font-medium uppercase tracking-[0.16em] text-sky-700">
             Crypto form checker
           </p>
-          <h1 className="mt-2 text-3xl font-semibold sm:text-4xl">Whitelist Form Auditor</h1>
+          <h1 className="mt-2 text-3xl font-semibold sm:text-4xl">
+            Whitelist / Waitlist Form Auditor
+          </h1>
           <p className="mt-3 text-sm leading-6 text-zinc-600 sm:text-base">
-            Paste website whitelist. Tool ini akan isi data dummy, klik submit, lalu cek apakah data
-            benar-benar keluar dari browser ke server.
+            Paste website whitelist atau waitlist. Tool ini akan isi data dummy, klik submit, lalu
+            cek apakah data benar-benar keluar dari browser ke server.
           </p>
         </header>
 
@@ -59,11 +67,11 @@ export default function AuditorClient() {
         <section className="rounded border border-zinc-200 bg-white p-4 shadow-sm">
           <form className="flex flex-col gap-3" onSubmit={runAudit}>
             <label className="flex flex-col gap-2">
-              <span className="text-sm font-medium text-zinc-700">Website whitelist</span>
+              <span className="text-sm font-medium text-zinc-700">Website whitelist / waitlist</span>
               <input
                 value={targetUrl}
                 onChange={(event) => setTargetUrl(event.target.value)}
-                placeholder="https://example.com/whitelist"
+                placeholder="https://example.com/waitlist"
                 className="h-12 rounded border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-sky-600 focus:ring-2 focus:ring-sky-100"
               />
             </label>
@@ -77,9 +85,13 @@ export default function AuditorClient() {
           </form>
 
           <div className="mt-4 rounded border border-zinc-200 bg-zinc-50 px-3 py-3 text-xs leading-5 text-zinc-600">
-            Data dummy yang dipakai: <span className="font-mono text-zinc-900">{DUMMY_WALLET}</span>
+            Wallet dummy: <span className="font-mono text-zinc-900">{DUMMY_WALLET}</span>
             <br />
             X/Twitter dummy: <span className="font-mono text-zinc-900">{DUMMY_TWITTER}</span>
+            <br />
+            Email dummy: <span className="font-mono text-zinc-900">{DUMMY_EMAIL}</span>
+            <br />
+            Nama dummy: <span className="font-mono text-zinc-900">{DUMMY_NAME}</span>
           </div>
 
           {error ? (
@@ -102,14 +114,36 @@ export default function AuditorClient() {
             <h2 className="text-lg font-semibold">Bukti singkat</h2>
             <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2">
               <Fact label="Tombol submit berhasil diklik" value={report.submitClicked} />
-              <Fact label="Data dummy masuk request" value={report.payloadContainsDummyWallet} />
+              <Fact label="Request membawa data dummy" value={report.payloadContainsDummyData} />
               <Fact label="Ada request POST/PUT/PATCH" value={report.hasPostRequest} />
-              <Fact label="Hanya tersimpan di browser" value={report.usesLocalStorage} />
+              <Fact label="Data dummy tersimpan di browser" value={report.storageContainsDummyData} />
             </dl>
+
+            <div className="mt-5 rounded border border-sky-200 bg-sky-50 px-3 py-3 text-sm leading-6 text-sky-950">
+              <h3 className="font-semibold">Cara verifikasi hasil</h3>
+              <ol className="mt-2 list-decimal space-y-1 pl-5">
+                <li>
+                  Kalau <strong>Request membawa data dummy = Ya</strong>, berarti data form benar
+                  keluar dari browser ke endpoint server.
+                </li>
+                <li>
+                  Kalau ada endpoint di bawah, itu alamat server yang menerima request saat tombol
+                  submit diklik.
+                </li>
+                <li>
+                  Kalau <strong>Data dummy tersimpan di browser = Ya</strong> tapi request dummy
+                  tidak ada, form hanya menyimpan data lokal di browser.
+                </li>
+                <li>
+                  Kalau semuanya <strong>Tidak</strong>, submit tidak mengirim data yang bisa
+                  terdeteksi oleh tool ini.
+                </li>
+              </ol>
+            </div>
 
             {report.requests.length > 0 ? (
               <div className="mt-5">
-                <h3 className="text-sm font-semibold text-zinc-800">Request yang tertangkap</h3>
+                <h3 className="text-sm font-semibold text-zinc-800">Result detail</h3>
                 <div className="mt-2 space-y-2">
                   {report.requests.slice(0, 5).map((request) => (
                     <div
@@ -118,6 +152,22 @@ export default function AuditorClient() {
                     >
                       <div className="font-medium text-zinc-900">{request.method}</div>
                       <div className="mt-1 break-all text-zinc-600">{request.url}</div>
+                      <div className="mt-2 text-zinc-700">
+                        Membawa dummy data:{" "}
+                        <span className={request.containsDummyData ? "text-emerald-700" : "text-red-700"}>
+                          {request.containsDummyData ? "Ya" : "Tidak"}
+                        </span>
+                      </div>
+                      {request.postDataPreview ? (
+                        <details className="mt-2 rounded border border-zinc-200 bg-white">
+                          <summary className="cursor-pointer px-2 py-1 font-medium text-zinc-800">
+                            Lihat payload preview
+                          </summary>
+                          <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all border-t border-zinc-200 p-2 text-[11px] leading-5 text-zinc-700">
+                            {request.postDataPreview}
+                          </pre>
+                        </details>
+                      ) : null}
                     </div>
                   ))}
                 </div>
@@ -167,7 +217,7 @@ function getSimpleResult(report: LiveAuditReport | null) {
     return {
       title: "Data dummy terkirim ke server",
       description:
-        "Saat form dites, wallet dummy masuk ke request POST/PUT/PATCH. Dari luar kita bisa membuktikan data keluar ke server. Penyimpanan ke database tidak bisa dibuktikan tanpa akses backend.",
+        "Saat form dites, data dummy masuk ke request POST/PUT/PATCH. Dari luar kita bisa membuktikan data keluar ke server. Penyimpanan ke database tetap butuh akses backend untuk dibuktikan penuh.",
       className: "border-emerald-200 bg-emerald-50 text-emerald-900",
     };
   }
@@ -185,7 +235,7 @@ function getSimpleResult(report: LiveAuditReport | null) {
     return {
       title: "Data tidak terkirim ke mana-mana",
       description:
-        "Form berhasil dites, tapi tidak ada request pengiriman data dummy dan tidak ada penyimpanan data dummy di browser. Ini bisa berarti UI hanya pajangan atau submit tidak jalan.",
+        "Form berhasil dites, tapi tidak ada request pengiriman data dummy dan tidak ada penyimpanan data dummy di browser. Ini bisa berarti UI hanya pajangan, submit tidak jalan, atau form butuh langkah manual tambahan.",
       className: "border-red-200 bg-red-50 text-red-900",
     };
   }
