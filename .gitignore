@@ -1,0 +1,16 @@
+.next/
+node_modules/
+.agents/
+.codex/
+out/
+dist/
+coverage/
+output/playwright/
+next-dev.*.log
+.env
+.env*
+!.env.example
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
