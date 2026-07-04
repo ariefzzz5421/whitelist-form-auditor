@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Whitelist Form Auditor",
-  description: "Audit whitelist forms for backend submission and local storage behavior.",
+  title: "Whitelist / Waitlist Submission Detector",
+  description: "Chrome Extension companion for YES/NO dummy form submission detection.",
 };
 
 export default function RootLayout({
