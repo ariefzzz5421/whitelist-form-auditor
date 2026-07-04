@@ -1,91 +1,65 @@
-# Whitelist / Waitlist Submission Detector
+# YES / NO Whitelist Form Detector
 
-This project is a Chrome Extension companion for the Vercel documentation dashboard.
+Simple tool for checking one thing:
 
-The tool answers one question only:
+**Did dummy whitelist/waitlist data leave the browser and get sent to a non-analytics server endpoint?**
 
-**Did the submitted dummy data leave the browser and get sent to a non-analytics server endpoint?**
+The result is intentionally binary:
 
-It does **not** claim that data was saved to a database.
+- `YES - DATA SENT TO SERVER`
+- `NO - NO SERVER SUBMISSION DETECTED`
 
-## Result Meaning
+## What The Web Tool Does
 
-### YES - DATA SENT TO SERVER
-
-The extension saw a non-analytics request from the active tab that:
-
-- happened after the audit started
-- used `POST`, `PUT`, `PATCH`, or a GraphQL mutation
-- contained at least one generated dummy marker
-- did not go to a known analytics/tracking endpoint
-
-### NO - NO SERVER SUBMISSION DETECTED
-
-No matching request containing the dummy data was detected during the audit window.
-
-This can mean the form is fake frontend UI, only stores data locally, did not submit, blocked the request, or uses a flow the extension cannot observe.
-
-## Why It Does Not Claim Database Persistence
-
-From the browser, the extension can see whether dummy data is sent to a server endpoint. It cannot see what the backend does after receiving that request.
-
-Saving to a database can only be proven with backend access, logs, database records, or admin tooling from the website owner.
-
-## Load The Extension Unpacked In Chrome
-
-1. Open Chrome.
-2. Go to `chrome://extensions`.
-3. Enable **Developer mode**.
-4. Click **Load unpacked**.
-5. Select this folder:
-
-   ```text
-   extension
-   ```
-
-6. Pin or open the extension, then open its side panel.
-
-## Run An Audit
-
-1. Open the target whitelist or waitlist website in Chrome.
-2. Open the extension side panel.
-3. Click **START AUDIT**.
-4. Copy the generated dummy values:
+1. User pastes a whitelist or waitlist website URL.
+2. The backend opens that URL in headless Chromium.
+3. The tool generates unique dummy data:
    - wallet
-   - X/Twitter handle
    - email
+   - X/Twitter handle
    - name
-5. Manually paste those dummy values into the target form.
-6. Submit the form yourself.
-7. The extension watches requests for 10 seconds after submit.
-8. Read the result:
-   - `YES - DATA SENT TO SERVER`
-   - `NO - NO SERVER SUBMISSION DETECTED`
+4. The tool fills matching form fields.
+5. The tool clicks a safe submit button.
+6. It watches network requests for 10 seconds.
+7. It checks requests similar to manual DevTools flow:
+   - Inspect
+   - Network
+   - Fetch/XHR or form submission request
+   - Preserve log
+   - Submit dummy data
+   - Check request payload and response status
 
-## Safety Rules
+## YES Meaning
 
-- Do not connect a wallet.
+`YES - DATA SENT TO SERVER` means:
+
+- a non-analytics request was detected
+- the request used `POST`, `PUT`, `PATCH`, or GraphQL mutation
+- the request payload contained at least one unique dummy marker
+- the response status was captured when available
+
+## NO Meaning
+
+`NO - NO SERVER SUBMISSION DETECTED` means:
+
+- no matching request containing the dummy data was detected
+
+This can happen if the frontend is fake, the form only stores locally, the website blocks automation, the submit button is not detected, or the request does not include the dummy markers.
+
+## Database Limitation
+
+The tool does **not** prove database persistence.
+
+From outside the website, we can detect whether dummy data was sent to a server endpoint. We cannot prove what the backend does after receiving it. Database proof requires backend logs, database access, or admin tooling from the website owner.
+
+## Safety
+
+- Do not connect wallets.
 - Do not sign messages.
 - Do not execute transactions.
 - Do not enter real credentials.
-- Do not submit a real wallet address.
-- Use only generated dummy data.
+- The tool only uses generated dummy data.
 
-## Ignored Analytics Domains
+## Chrome Extension
 
-The detector ignores common analytics and tracking endpoints, including:
-
-- `google-analytics.com`
-- `googletagmanager.com`
-- `cloudflareinsights.com`
-- `sentry.io`
-- `segment.io`
-- `mixpanel.com`
-- `amplitude.com`
-- `doubleclick.net`
-
-## Local Audit History
-
-Audit history is stored locally in Chrome using `chrome.storage.local`.
-
-The Vercel dashboard is only for documentation and product context.
+The repo also includes an optional Chrome extension in `extension/` for manual audits from the browser side panel. The main product flow is the web dashboard.

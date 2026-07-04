@@ -1,23 +1,34 @@
-import type { Browser, Page } from "playwright-core";
-import {
-  DUMMY_EMAIL,
-  DUMMY_NAME,
-  DUMMY_TWITTER,
-  DUMMY_WALLET,
-  type CapturedRequest,
-  type LiveAuditReport,
-  type LiveVerdict,
-  type StorageEventCapture,
+import { randomBytes } from "node:crypto";
+import type { Browser, Page, Request } from "playwright-core";
+import type {
+  CapturedRequest,
+  DummyAuditData,
+  LiveAuditReport,
+  LiveVerdict,
 } from "@/lib/audit/types";
 import { LIVE_AUDIT_TIMEOUT_MS } from "@/lib/audit/security";
 
 const SUBMISSION_METHODS = new Set(["POST", "PUT", "PATCH"]);
+const POST_SUBMIT_WAIT_MS = 10_000;
 const MAX_CAPTURED_REQUESTS = 25;
-const DUMMY_VALUES = [DUMMY_WALLET, DUMMY_TWITTER, DUMMY_EMAIL, DUMMY_NAME];
+
+const ANALYTICS_DOMAINS = [
+  "google-analytics.com",
+  "googletagmanager.com",
+  "cloudflareinsights.com",
+  "sentry.io",
+  "segment.io",
+  "mixpanel.com",
+  "amplitude.com",
+  "doubleclick.net",
+];
 
 export async function runLiveAudit(targetUrl: URL): Promise<LiveAuditReport> {
   const startedAt = Date.now();
+  const dummyData = createDummyData();
+  const dummyValues = Object.values(dummyData);
   const requests: CapturedRequest[] = [];
+  const requestMap = new Map<Request, CapturedRequest>();
   const notes: string[] = [];
 
   const browser = await launchAuditBrowser();
@@ -27,75 +38,55 @@ export async function runLiveAudit(targetUrl: URL): Promise<LiveAuditReport> {
       viewport: { width: 1365, height: 900 },
       ignoreHTTPSErrors: false,
       userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) WhitelistFormAuditor/1.0 Chrome/120 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) WhitelistFormAuditor/2.0 Chrome/120 Safari/537.36",
     });
-
-    await context.addInitScript(
-      ({ wallet, twitter, email, name }) => {
-        const existing = window as Window & {
-          __whitelistAuditStorageEvents?: StorageEventCapture[];
-        };
-        existing.__whitelistAuditStorageEvents = [];
-        const dummyValues = [wallet, twitter, email, name];
-
-        const originalSetItem = Storage.prototype.setItem;
-        Storage.prototype.setItem = function setItem(key: string, value: string) {
-          let area: StorageEventCapture["area"] = "unknown";
-          try {
-            if (this === window.localStorage) {
-              area = "localStorage";
-            } else if (this === window.sessionStorage) {
-              area = "sessionStorage";
-            }
-          } catch {
-            area = "unknown";
-          }
-
-          const normalizedValue = String(value);
-          const containsDummyData = dummyValues.some((dummyValue) => normalizedValue.includes(dummyValue));
-          existing.__whitelistAuditStorageEvents?.push({
-            area,
-            key: String(key),
-            valuePreview: normalizedValue.slice(0, 500),
-            containsDummyWallet: normalizedValue.includes(wallet),
-            containsDummyTwitter: normalizedValue.includes(twitter),
-            containsDummyEmail: normalizedValue.includes(email),
-            containsDummyName: normalizedValue.includes(name),
-            containsDummyData,
-            timestamp: Date.now(),
-          });
-
-          return originalSetItem.apply(this, [key, value]);
-        };
-      },
-      { wallet: DUMMY_WALLET, twitter: DUMMY_TWITTER, email: DUMMY_EMAIL, name: DUMMY_NAME },
-    );
-
     const page = await context.newPage();
 
     page.on("request", (request) => {
-      if (!SUBMISSION_METHODS.has(request.method()) || requests.length >= MAX_CAPTURED_REQUESTS) {
+      if (requests.length >= MAX_CAPTURED_REQUESTS || isAnalyticsUrl(request.url())) {
         return;
       }
 
       const postData = request.postData() || "";
-      const containsDummyWallet = postData.includes(DUMMY_WALLET);
-      const containsDummyTwitter = postData.includes(DUMMY_TWITTER);
-      const containsDummyEmail = postData.includes(DUMMY_EMAIL);
-      const containsDummyName = postData.includes(DUMMY_NAME);
-      const containsDummyData = containsAnyDummyValue(postData);
-      requests.push({
+      const graphqlMutation = /\bmutation\b/i.test(postData) || /\bmutation\b/i.test(request.url());
+      if (!SUBMISSION_METHODS.has(request.method()) && !graphqlMutation) {
+        return;
+      }
+
+      const detectedMarkers = detectMarkers(postData, dummyData);
+      if (detectedMarkers.length === 0) {
+        return;
+      }
+
+      const captured: CapturedRequest = {
         url: request.url(),
         method: request.method(),
         resourceType: request.resourceType(),
+        statusCode: null,
+        responseOk: null,
         postDataPreview: postData.slice(0, 1_000),
-        containsDummyWallet,
-        containsDummyTwitter,
-        containsDummyEmail,
-        containsDummyName,
-        containsDummyData,
+        containsDummyWallet: detectedMarkers.includes("wallet"),
+        containsDummyTwitter: detectedMarkers.includes("X/Twitter"),
+        containsDummyEmail: detectedMarkers.includes("email"),
+        containsDummyName: detectedMarkers.includes("name"),
+        containsDummyData: true,
+        detectedMarkers,
+        graphqlMutation,
         timestamp: new Date().toISOString(),
-      });
+      };
+
+      requests.push(captured);
+      requestMap.set(request, captured);
+    });
+
+    page.on("response", (response) => {
+      const captured = requestMap.get(response.request());
+      if (!captured) {
+        return;
+      }
+
+      captured.statusCode = response.status();
+      captured.responseOk = response.ok();
     });
 
     await page.goto(targetUrl.toString(), {
@@ -106,7 +97,7 @@ export async function runLiveAudit(targetUrl: URL): Promise<LiveAuditReport> {
       notes.push("Page did not become fully idle before interaction.");
     });
 
-    const fillResult = await fillTargetInputs(page);
+    const fillResult = await fillTargetInputs(page, dummyData);
     notes.push(...fillResult.notes);
 
     const submitClicked = await clickSubmitButton(page);
@@ -114,36 +105,15 @@ export async function runLiveAudit(targetUrl: URL): Promise<LiveAuditReport> {
       notes.push("No safe submit button was clicked.");
     }
 
-    await page.waitForTimeout(3_000);
+    await page.waitForTimeout(POST_SUBMIT_WAIT_MS);
+    await context.close();
 
-    const storageEvents = await page
-      .evaluate(() => {
-        const existing = window as Window & {
-          __whitelistAuditStorageEvents?: StorageEventCapture[];
-        };
-        return existing.__whitelistAuditStorageEvents || [];
-      })
-      .catch(() => {
-        notes.push("Could not read storage monitor results after interaction.");
-        return [] as StorageEventCapture[];
-      });
-
-    const hasPostRequest = requests.length > 0;
-    const payloadContainsDummyWallet = requests.some((request) => request.containsDummyWallet);
-    const payloadContainsDummyTwitter = requests.some((request) => request.containsDummyTwitter);
-    const payloadContainsDummyEmail = requests.some((request) => request.containsDummyEmail);
-    const payloadContainsDummyName = requests.some((request) => request.containsDummyName);
     const payloadContainsDummyData = requests.some((request) => request.containsDummyData);
-    const usesLocalStorage = storageEvents.some((event) => event.area === "localStorage");
-    const storageContainsDummyData = storageEvents.some((event) => event.containsDummyData);
-    const verdict = classifyLive({
-      payloadContainsDummyData,
-    });
+    const verdict = classifyLive(payloadContainsDummyData);
     const result = verdict === "DATA_SENT_TO_SERVER" ? "YES" : "NO";
     const reason = buildReason({
       payloadContainsDummyData,
-      hasPostRequest,
-      storageContainsDummyData,
+      hasPostRequest: requests.length > 0,
       filledAnyInput:
         fillResult.walletFilled ||
         fillResult.twitterFilled ||
@@ -152,21 +122,20 @@ export async function runLiveAudit(targetUrl: URL): Promise<LiveAuditReport> {
       submitClicked,
     });
 
-    await context.close();
-
     return {
       targetUrl: targetUrl.toString(),
       scannedAt: new Date().toISOString(),
+      dummyData,
       requests,
-      storageEvents,
-      hasPostRequest,
-      payloadContainsDummyWallet,
-      payloadContainsDummyTwitter,
-      payloadContainsDummyEmail,
-      payloadContainsDummyName,
+      storageEvents: [],
+      hasPostRequest: requests.length > 0,
+      payloadContainsDummyWallet: requests.some((request) => request.containsDummyWallet),
+      payloadContainsDummyTwitter: requests.some((request) => request.containsDummyTwitter),
+      payloadContainsDummyEmail: requests.some((request) => request.containsDummyEmail),
+      payloadContainsDummyName: requests.some((request) => request.containsDummyName),
       payloadContainsDummyData,
-      storageContainsDummyData,
-      usesLocalStorage,
+      storageContainsDummyData: false,
+      usesLocalStorage: false,
       walletFilled: fillResult.walletFilled,
       twitterFilled: fillResult.twitterFilled,
       emailFilled: fillResult.emailFilled,
@@ -208,7 +177,7 @@ async function launchAuditBrowser(): Promise<Browser> {
   return chromium.launch({ headless: true });
 }
 
-async function fillTargetInputs(page: Page) {
+async function fillTargetInputs(page: Page, dummyData: DummyAuditData) {
   const notes: string[] = [];
   const locator = page.locator("input, textarea");
   const fields = await locator.evaluateAll((elements) =>
@@ -228,7 +197,6 @@ async function fillTargetInputs(page: Page) {
 
       return {
         index,
-        tagName: input.tagName.toLowerCase(),
         type: "type" in input ? (input.type || "text").toLowerCase() : "textarea",
         name: "name" in input ? input.name || "" : "",
         id,
@@ -252,12 +220,9 @@ async function fillTargetInputs(page: Page) {
   });
 
   const usedIndexes = new Set<number>();
-  const walletCandidate =
-    fillable.find((field) => walletPattern.test(fieldText(field))) ||
-    fillable.find((field) => /0x|ethereum|evm/i.test(field.placeholder));
-  if (walletCandidate) {
-    usedIndexes.add(walletCandidate.index);
-  }
+  const walletCandidate = findUnusedField(fillable, usedIndexes, (field) => {
+    return walletPattern.test(fieldText(field)) || /0x|ethereum|evm/i.test(field.placeholder);
+  });
   const emailCandidate = findUnusedField(fillable, usedIndexes, (field) => {
     return field.type === "email" || emailPattern.test(fieldText(field));
   });
@@ -267,48 +232,27 @@ async function fillTargetInputs(page: Page) {
   const nameCandidate = findUnusedField(fillable, usedIndexes, (field) => {
     return namePattern.test(fieldText(field));
   });
-  const fallbackCandidate = findUnusedField(fillable, usedIndexes, () => true);
-  let walletFilled = false;
-  let twitterFilled = false;
-  let emailFilled = false;
-  let nameFilled = false;
+  const genericCandidate = findUnusedField(fillable, usedIndexes, () => true);
 
-  if (walletCandidate) {
-    usedIndexes.add(walletCandidate.index);
-    walletFilled = await fillField(locator, walletCandidate.index, DUMMY_WALLET, "Wallet", notes);
-  } else {
-    notes.push("No fillable wallet-like input was found.");
-  }
+  const walletFilled = walletCandidate
+    ? await fillField(locator, walletCandidate.index, dummyData.wallet, "Wallet", notes)
+    : genericCandidate
+      ? await fillField(locator, genericCandidate.index, dummyData.wallet, "Generic wallet", notes)
+      : false;
+  const emailFilled = emailCandidate
+    ? await fillField(locator, emailCandidate.index, dummyData.email, "Email", notes)
+    : false;
+  const twitterFilled = twitterCandidate
+    ? await fillField(locator, twitterCandidate.index, dummyData.twitter, "Twitter/X", notes)
+    : false;
+  const nameFilled = nameCandidate
+    ? await fillField(locator, nameCandidate.index, dummyData.name, "Name", notes)
+    : false;
 
-  if (emailCandidate) {
-    usedIndexes.add(emailCandidate.index);
-    emailFilled = await fillField(locator, emailCandidate.index, DUMMY_EMAIL, "Email", notes);
-  }
-
-  if (twitterCandidate) {
-    usedIndexes.add(twitterCandidate.index);
-    twitterFilled = await fillField(locator, twitterCandidate.index, DUMMY_TWITTER, "Twitter/X", notes);
-  }
-
-  if (nameCandidate) {
-    usedIndexes.add(nameCandidate.index);
-    nameFilled = await fillField(locator, nameCandidate.index, DUMMY_NAME, "Name", notes);
-  } else if (!walletFilled && !emailFilled && !twitterFilled && fallbackCandidate) {
-    usedIndexes.add(fallbackCandidate.index);
-    nameFilled = await fillField(locator, fallbackCandidate.index, DUMMY_NAME, "Generic text", notes);
-  }
-
-  if (!emailFilled) {
-    notes.push("No fillable email-like input was found.");
-  }
-
-  if (!twitterFilled) {
-    notes.push("No fillable Twitter/X-like input was found.");
-  }
-
-  if (!nameFilled) {
-    notes.push("No fillable name-like input was found.");
-  }
+  if (!walletFilled) notes.push("No wallet or generic text input was filled.");
+  if (!emailFilled) notes.push("No email-like input was filled.");
+  if (!twitterFilled) notes.push("No Twitter/X-like input was filled.");
+  if (!nameFilled) notes.push("No name-like input was filled.");
 
   return { walletFilled, twitterFilled, emailFilled, nameFilled, notes };
 }
@@ -364,48 +308,75 @@ async function clickSubmitButton(page: Page) {
     .catch(() => false);
 }
 
-function classifyLive({
-  payloadContainsDummyData,
-}: {
-  payloadContainsDummyData: boolean;
-}): LiveVerdict {
-  if (payloadContainsDummyData) {
-    return "DATA_SENT_TO_SERVER";
-  }
-
-  return "NO_DATA_SENT";
+function classifyLive(payloadContainsDummyData: boolean): LiveVerdict {
+  return payloadContainsDummyData ? "DATA_SENT_TO_SERVER" : "NO_DATA_SENT";
 }
 
 function buildReason({
   payloadContainsDummyData,
   hasPostRequest,
-  storageContainsDummyData,
   filledAnyInput,
   submitClicked,
 }: {
   payloadContainsDummyData: boolean;
   hasPostRequest: boolean;
-  storageContainsDummyData: boolean;
   filledAnyInput: boolean;
   submitClicked: boolean;
 }) {
   if (payloadContainsDummyData) {
-    return "Dummy data was found inside a POST/PUT/PATCH request payload.";
+    return "Dummy marker was found inside a non-analytics server request payload.";
   }
 
   if (hasPostRequest) {
-    return "The page made a POST/PUT/PATCH request, but the dummy form data was not inside that payload.";
-  }
-
-  if (storageContainsDummyData) {
-    return "Dummy data was only written to browser storage, not sent in a server request.";
+    return "A submission request was found, but it did not contain the dummy marker.";
   }
 
   if (filledAnyInput && submitClicked) {
-    return "Inputs were filled and submit was clicked, but no server request carried the dummy data.";
+    return "Dummy data was filled and submit was clicked, but no matching server request was detected.";
   }
 
-  return "The tool could not safely fill and submit the form, so no dummy data was sent during this test.";
+  return "The form could not be safely filled and submitted automatically.";
+}
+
+function createDummyData(): DummyAuditData {
+  const suffix = randomBytes(6).toString("hex");
+  return {
+    wallet: `0x${randomBytes(20).toString("hex")}`,
+    twitter: `audit_${suffix}`,
+    email: `audit_${suffix}@example.com`,
+    name: `Audit User ${suffix}`,
+  };
+}
+
+function detectMarkers(text: string, dummyData: DummyAuditData) {
+  const markers: string[] = [];
+  const checks: Array<[keyof DummyAuditData, string]> = [
+    ["wallet", "wallet"],
+    ["twitter", "X/Twitter"],
+    ["email", "email"],
+    ["name", "name"],
+  ];
+
+  for (const [key, label] of checks) {
+    if (markerVariants(dummyData[key]).some((variant) => text.includes(variant))) {
+      markers.push(label);
+    }
+  }
+
+  return markers;
+}
+
+function markerVariants(value: string) {
+  return [value, encodeURIComponent(value), encodeURI(value), value.replace(/\s/g, "+")];
+}
+
+function isAnalyticsUrl(url: string) {
+  try {
+    const hostname = new URL(url).hostname.replace(/^www\./, "").toLowerCase();
+    return ANALYTICS_DOMAINS.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+  } catch {
+    return true;
+  }
 }
 
 function fieldText(field: {
@@ -451,8 +422,4 @@ const walletPattern = /\b(wallet|wallet address|address|eth|ethereum|evm|base|pu
 const emailPattern = /\b(email|e-mail|mail)\b/i;
 const twitterPattern = /\b(twitter|x handle|x account|x username|handle|username)\b/i;
 const namePattern = /\b(name|full name|nama|nama lengkap|first name|last name)\b/i;
-const submitPattern = /\b(submit|join|whitelist|register|apply|claim|mint|send|enter|continue)\b/i;
-
-function containsAnyDummyValue(value: string) {
-  return DUMMY_VALUES.some((dummyValue) => value.includes(dummyValue));
-}
+const submitPattern = /\b(submit|join|whitelist|waitlist|register|apply|claim|mint|send|enter|continue|sign up|signup)\b/i;

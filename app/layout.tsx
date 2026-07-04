@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Whitelist / Waitlist Submission Detector",
-  description: "Chrome Extension companion for YES/NO dummy form submission detection.",
+  title: "YES / NO Whitelist Form Detector",
+  description: "Paste a whitelist or waitlist URL and detect whether dummy data is sent to a server.",
 };
 
 export default function RootLayout({

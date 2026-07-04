@@ -1,8 +1,3 @@
-export const DUMMY_WALLET = "0x000000000000000000000000000000000000dEaD";
-export const DUMMY_TWITTER = "test_audit_123456";
-export const DUMMY_EMAIL = "audit_waitlist_123456@example.com";
-export const DUMMY_NAME = "Audit Test User";
-
 export const LIVE_AUDIT_RATE_LIMIT = {
   limit: 4,
   windowMs: 5 * 60_000,
@@ -79,12 +74,16 @@ export interface CapturedRequest {
   url: string;
   method: string;
   resourceType: string;
+  statusCode: number | null;
+  responseOk: boolean | null;
   postDataPreview: string;
   containsDummyWallet: boolean;
   containsDummyTwitter: boolean;
   containsDummyEmail: boolean;
   containsDummyName: boolean;
   containsDummyData: boolean;
+  detectedMarkers: string[];
+  graphqlMutation: boolean;
   timestamp: string;
 }
 
@@ -108,9 +107,17 @@ export interface RateLimitInfo {
   resetAt: string;
 }
 
+export interface DummyAuditData {
+  wallet: string;
+  twitter: string;
+  email: string;
+  name: string;
+}
+
 export interface LiveAuditReport {
   targetUrl: string;
   scannedAt: string;
+  dummyData: DummyAuditData;
   requests: CapturedRequest[];
   storageEvents: StorageEventCapture[];
   hasPostRequest: boolean;
