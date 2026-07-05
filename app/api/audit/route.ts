@@ -1,19 +1,20 @@
 import { NextResponse } from "next/server";
-import { runLiveAudit } from "@/lib/audit/live-scan";
+import { runBrowserlessAudit } from "@/lib/audit/browserless-audit";
 import { consumeRateLimit, getClientKey } from "@/lib/audit/rate-limit";
 import { UrlValidationError, validatePublicTargetUrl } from "@/lib/audit/security";
 import { LIVE_AUDIT_RATE_LIMIT } from "@/lib/audit/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 30;
+export const maxDuration = 45;
 
 export async function POST(request: Request) {
   const rate = consumeRateLimit(
-    `live:${getClientKey(request)}`,
+    `browserless:${getClientKey(request)}`,
     LIVE_AUDIT_RATE_LIMIT.limit,
     LIVE_AUDIT_RATE_LIMIT.windowMs,
   );
+
   if (!rate.allowed) {
     return NextResponse.json(
       {
@@ -27,7 +28,7 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     const targetUrl = await validatePublicTargetUrl(body?.url);
-    const report = await runLiveAudit(targetUrl);
+    const report = await runBrowserlessAudit(targetUrl);
     return NextResponse.json(
       {
         ...report,
@@ -36,25 +37,13 @@ export async function POST(request: Request) {
       { headers: buildRateLimitHeaders(rate.remaining, rate.resetAt) },
     );
   } catch (error) {
-    return errorResponse(error);
-  }
-}
+    if (error instanceof UrlValidationError) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
+    }
 
-function errorResponse(error: unknown) {
-  if (error instanceof UrlValidationError) {
-    return NextResponse.json({ error: error.message }, { status: 400 });
+    const message = error instanceof Error ? error.message : "Audit failed.";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
-
-  const message = error instanceof Error ? error.message : "Live audit failed.";
-  if (/Executable doesn't exist|browserType\.launch|chromium/i.test(message)) {
-    return NextResponse.json(
-      { error: "Live audit needs Playwright Chromium installed on this machine." },
-      { status: 503 },
-    );
-  }
-
-  const status = /timed out|Timeout/i.test(message) ? 504 : 502;
-  return NextResponse.json({ error: message }, { status });
 }
 
 function secondsUntil(timestamp: number) {

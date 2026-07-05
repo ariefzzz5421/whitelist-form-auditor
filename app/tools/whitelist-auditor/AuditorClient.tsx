@@ -1,26 +1,58 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
-import type { CapturedRequest, LiveAuditReport } from "@/lib/audit/types";
+import { FormEvent, useEffect, useMemo, useState } from "react";
+
+type Verdict = "YES" | "NO_EVIDENCE" | "INCONCLUSIVE";
+
+interface AuditResponse {
+  verdict: Verdict;
+  message: string;
+  targetUrl: string;
+  method?: string;
+  endpoint?: string;
+  endpointDomain?: string;
+  status?: number | null;
+  detectedMarkers?: string[];
+  auditId: string;
+  reason?: string;
+}
+
+const LOADING_STEPS = [
+  "Opening website",
+  "Detecting form",
+  "Filling dummy values",
+  "Submitting",
+  "Inspecting network",
+];
 
 export default function AuditorClient() {
   const [targetUrl, setTargetUrl] = useState("");
-  const [report, setReport] = useState<LiveAuditReport | null>(null);
+  const [report, setReport] = useState<AuditResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingIndex, setLoadingIndex] = useState(0);
   const [error, setError] = useState("");
 
-  const bestRequest = useMemo(() => {
-    return report?.requests.find((request) => request.containsDummyData) || null;
-  }, [report]);
+  const currentStep = useMemo(() => LOADING_STEPS[Math.min(loadingIndex, LOADING_STEPS.length - 1)], [loadingIndex]);
+
+  useEffect(() => {
+    if (!loading) return;
+
+    const timer = window.setInterval(() => {
+      setLoadingIndex((value) => Math.min(value + 1, LOADING_STEPS.length - 1));
+    }, 2_500);
+
+    return () => window.clearInterval(timer);
+  }, [loading]);
 
   async function runAudit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError("");
     setReport(null);
+    setLoadingIndex(0);
     setLoading(true);
 
     try {
-      const response = await fetch("/api/audit/live", {
+      const response = await fetch("/api/audit", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ url: normalizeUrl(targetUrl) }),
@@ -31,7 +63,7 @@ export default function AuditorClient() {
         throw new Error(payload?.error || "Audit failed.");
       }
 
-      setReport(payload as LiveAuditReport);
+      setReport(payload as AuditResponse);
     } catch (auditError) {
       setError(auditError instanceof Error ? auditError.message : "Audit failed.");
     } finally {
@@ -41,21 +73,21 @@ export default function AuditorClient() {
 
   return (
     <main className="min-h-screen bg-zinc-50 px-4 py-6 text-zinc-950 sm:px-6">
-      <div className="mx-auto flex w-full max-w-3xl flex-col gap-5">
+      <div className="mx-auto flex w-full max-w-2xl flex-col gap-5">
         <header className="border-b border-zinc-200 pb-5">
           <p className="text-sm font-semibold uppercase tracking-[0.16em] text-sky-700">
-            Simple Whitelist Checker
+            Browser Submission Detector
           </p>
-          <h1 className="mt-2 text-3xl font-semibold sm:text-4xl">YES / NO Form Detector</h1>
+          <h1 className="mt-2 text-3xl font-semibold sm:text-4xl">Whitelist Form Auditor</h1>
           <p className="mt-3 text-sm leading-6 text-zinc-600 sm:text-base">
-            Paste website whitelist atau waitlist. Tool akan buka website, isi dummy data, submit,
-            lalu cek request seperti Inspect Network.
+            Paste URL, click CHECK, lalu tool membuka website di remote browser dan mengecek apakah
+            dummy data keluar lewat request server.
           </p>
         </header>
 
         <section className="rounded border border-amber-300 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-950">
-          <strong>Penting:</strong> Tool ini membuktikan data dummy terkirim ke server endpoint.
-          Bukan bukti pasti data tersimpan di database, karena database hanya bisa dicek dari backend.
+          YES hanya berarti dummy data terkirim ke server endpoint. Ini bukan bukti permanen masuk
+          database.
         </section>
 
         <section className="rounded border border-zinc-200 bg-white p-4 shadow-sm">
@@ -74,14 +106,9 @@ export default function AuditorClient() {
               disabled={loading}
               className="h-12 rounded bg-zinc-950 px-4 text-sm font-semibold text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
             >
-              {loading ? "Checking..." : "CHECK NOW"}
+              {loading ? "CHECKING..." : "CHECK"}
             </button>
           </form>
-
-          <p className="mt-3 text-xs leading-5 text-zinc-500">
-            Format otomatis: kalau kamu paste <code>example.com</code>, tool akan mencoba{" "}
-            <code>https://example.com</code>.
-          </p>
 
           {error ? (
             <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
@@ -90,105 +117,66 @@ export default function AuditorClient() {
           ) : null}
         </section>
 
-        {report ? (
-          <ResultCard report={report} request={bestRequest} />
-        ) : loading ? (
-          <section className="rounded border border-zinc-200 bg-white p-5 text-sm leading-6 text-zinc-700 shadow-sm">
-            Membuka website, generate dummy wallet, isi form, submit, lalu tunggu response network.
-            Biasanya butuh 10-20 detik.
-          </section>
-        ) : null}
-
-        {report ? (
-          <section className="rounded border border-zinc-200 bg-white p-4 shadow-sm">
-            <h2 className="text-lg font-semibold">Dummy data yang dipakai</h2>
-            <div className="mt-3 grid gap-2 text-xs">
-              <DummyRow label="Wallet" value={report.dummyData.wallet} />
-              <DummyRow label="Email" value={report.dummyData.email} />
-              <DummyRow label="X/Twitter" value={report.dummyData.twitter} />
-              <DummyRow label="Name" value={report.dummyData.name} />
+        {loading ? (
+          <section className="rounded border border-zinc-200 bg-white p-5 shadow-sm">
+            <p className="text-sm font-semibold uppercase tracking-[0.14em] text-zinc-500">Loading</p>
+            <p className="mt-3 text-xl font-semibold text-zinc-950">{currentStep}</p>
+            <div className="mt-4 h-2 overflow-hidden rounded bg-zinc-100">
+              <div
+                className="h-full rounded bg-zinc-950 transition-all"
+                style={{ width: `${((loadingIndex + 1) / LOADING_STEPS.length) * 100}%` }}
+              />
             </div>
           </section>
         ) : null}
 
-        {report ? (
-          <section className="rounded border border-zinc-200 bg-white p-4 shadow-sm">
-            <h2 className="text-lg font-semibold">Network result</h2>
-            {bestRequest ? (
-              <RequestDetails request={bestRequest} />
-            ) : (
-              <p className="mt-3 text-sm leading-6 text-zinc-600">
-                Tidak ada request Fetch/XHR/POST yang membawa dummy data.
-              </p>
-            )}
-          </section>
-        ) : null}
+        {report ? <ResultCard report={report} /> : null}
       </div>
     </main>
   );
 }
 
-function ResultCard({
-  report,
-  request,
-}: {
-  report: LiveAuditReport;
-  request: CapturedRequest | null;
-}) {
-  if (report.result === "YES") {
+function ResultCard({ report }: { report: AuditResponse }) {
+  if (report.verdict === "YES") {
     return (
       <section className="rounded border border-emerald-200 bg-emerald-50 p-5 text-emerald-950 shadow-sm">
         <p className="text-sm font-semibold uppercase tracking-[0.14em]">Result</p>
-        <h2 className="mt-3 text-3xl font-bold">YES - DATA SENT TO SERVER</h2>
-        <p className="mt-3 text-sm leading-6">
-          Dummy data ditemukan di request server. Status response:{" "}
-          <strong>{formatStatus(request)}</strong>.
-        </p>
+        <h2 className="mt-3 text-3xl font-bold">✅ YES</h2>
+        <p className="mt-1 text-lg font-semibold">DATA SENT TO SERVER</p>
+        <dl className="mt-4 grid gap-3 text-sm">
+          <InfoRow label="Method" value={report.method || "Unknown"} />
+          <InfoRow label="Endpoint domain" value={report.endpointDomain || endpointDomain(report.endpoint)} />
+          <InfoRow label="Status" value={formatStatus(report.status)} />
+          <InfoRow label="Detected dummy fields" value={(report.detectedMarkers || []).join(", ")} />
+        </dl>
+      </section>
+    );
+  }
+
+  if (report.verdict === "NO_EVIDENCE") {
+    return (
+      <section className="rounded border border-red-200 bg-red-50 p-5 text-red-950 shadow-sm">
+        <p className="text-sm font-semibold uppercase tracking-[0.14em]">Result</p>
+        <h2 className="mt-3 text-3xl font-bold">❌ NO EVIDENCE</h2>
+        <p className="mt-3 text-sm leading-6">No matching server submission detected.</p>
       </section>
     );
   }
 
   return (
-    <section className="rounded border border-red-200 bg-red-50 p-5 text-red-950 shadow-sm">
+    <section className="rounded border border-amber-200 bg-amber-50 p-5 text-amber-950 shadow-sm">
       <p className="text-sm font-semibold uppercase tracking-[0.14em]">Result</p>
-      <h2 className="mt-3 text-3xl font-bold">NO - NO SERVER SUBMISSION DETECTED</h2>
-      <p className="mt-3 text-sm leading-6">
-        No request containing the submitted dummy data was detected.
-      </p>
+      <h2 className="mt-3 text-3xl font-bold">⚠️ COULDN&apos;T VERIFY</h2>
+      <p className="mt-3 text-sm leading-6">{report.reason || "Browser automation could not verify this page."}</p>
     </section>
-  );
-}
-
-function RequestDetails({ request }: { request: CapturedRequest }) {
-  return (
-    <dl className="mt-3 grid gap-3 text-sm">
-      <InfoRow label="Endpoint" value={request.url} />
-      <InfoRow label="Method" value={request.method} />
-      <InfoRow label="Status response" value={formatStatus(request)} />
-      <InfoRow label="Data dummy terdeteksi" value={request.detectedMarkers.join(", ")} />
-      <InfoRow label="Request type" value={request.graphqlMutation ? "GraphQL mutation" : request.resourceType} />
-    </dl>
-  );
-}
-
-function DummyRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded border border-zinc-200 bg-zinc-50 px-3 py-2">
-      <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">
-        {label}
-      </div>
-      <div className="mt-1 break-all font-mono text-zinc-900">{value}</div>
-    </div>
   );
 }
 
 function InfoRow({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded border border-zinc-200 bg-zinc-50 px-3 py-2">
-      <dt className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">
-        {label}
-      </dt>
-      <dd className="mt-1 break-all text-zinc-900">{value}</dd>
+    <div className="rounded border border-emerald-200 bg-white/70 px-3 py-2">
+      <dt className="text-[11px] font-semibold uppercase tracking-[0.12em] opacity-70">{label}</dt>
+      <dd className="mt-1 break-all font-medium">{value || "None"}</dd>
     </div>
   );
 }
@@ -198,18 +186,20 @@ function normalizeUrl(value: string) {
   if (/^https?:\/\//i.test(trimmed)) {
     return trimmed;
   }
-
   return `https://${trimmed}`;
 }
 
-function formatStatus(request: CapturedRequest | null) {
-  if (!request) {
-    return "No response";
-  }
+function formatStatus(status?: number | null) {
+  return typeof status === "number" ? String(status) : "No status captured";
+}
 
-  if (typeof request.statusCode !== "number") {
-    return "No response status captured";
+function endpointDomain(endpoint?: string) {
+  if (!endpoint) {
+    return "Unknown";
   }
-
-  return `${request.statusCode}${request.responseOk ? " OK" : " response"}`;
+  try {
+    return new URL(endpoint).hostname;
+  } catch {
+    return "Unknown";
+  }
 }
