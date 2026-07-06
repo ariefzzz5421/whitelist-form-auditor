@@ -22,7 +22,7 @@ The result is intentionally simple:
    - name
 5. The tool fills matching form fields across page frames.
 6. The tool clicks one safe submit button.
-7. It watches network requests for 10 seconds.
+7. It watches network requests for 12 seconds.
 8. It checks requests similar to manual DevTools flow:
    - Inspect
    - Network
@@ -39,6 +39,7 @@ The result is intentionally simple:
 - the request used `POST`, `PUT`, `PATCH`, or GraphQL mutation
 - the request payload contained at least one unique dummy marker
 - the response status was captured when available
+- redirect chains such as `302 -> 200` are shown when available
 
 It does not prove database persistence.
 
@@ -46,9 +47,14 @@ It does not prove database persistence.
 
 `NO EVIDENCE` means:
 
-- no matching request containing the dummy data was detected
+- the page loaded
+- a supported form field was detected
+- at least one dummy value was filled
+- submit was clicked
+- the monitoring window completed
+- no matching request containing the unique dummy marker was detected
 
-This can happen if the frontend is fake, the form only stores locally, the website blocks automation, the submit button is not detected, or the request does not include the dummy markers.
+Automation failures are reported as `INCONCLUSIVE`, not `NO EVIDENCE`.
 
 ## INCONCLUSIVE Meaning
 
