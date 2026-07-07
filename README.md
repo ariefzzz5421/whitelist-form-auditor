@@ -1,27 +1,29 @@
-# YES / NO Whitelist Form Detector
+# Whitelist Form Auditor
 
-Simple tool for checking one thing:
+Automated browser-based detector for one question:
 
-**Did dummy whitelist/waitlist data leave the browser and get sent to a non-analytics server endpoint?**
+**Did unique dummy whitelist/waitlist data leave the browser and get sent to a non-analytics server endpoint?**
 
-The result is intentionally binary:
+The result is intentionally simple:
 
 - `YES - DATA SENT TO SERVER`
-- `NO - NO SERVER SUBMISSION DETECTED`
+- `NO EVIDENCE - No matching server submission detected`
+- `INCONCLUSIVE - Could not verify`
 
-## What The Web Tool Does
+## What The Tool Does
 
 1. User pastes a whitelist or waitlist website URL.
-2. The backend opens that URL in headless Chromium.
-3. The tool generates unique dummy data:
+2. The backend connects to Browserless remote Chromium with Playwright CDP.
+3. The remote browser opens the target website.
+4. The tool generates a unique audit marker and dummy data:
    - wallet
    - email
    - X/Twitter handle
    - name
-4. The tool fills matching form fields.
-5. The tool clicks a safe submit button.
-6. It watches network requests for 10 seconds.
-7. It checks requests similar to manual DevTools flow:
+5. The tool fills matching form fields across page frames.
+6. The tool clicks one safe submit button.
+7. It watches network requests for 12 seconds.
+8. It checks requests similar to manual DevTools flow:
    - Inspect
    - Network
    - Fetch/XHR or form submission request
@@ -37,14 +39,33 @@ The result is intentionally binary:
 - the request used `POST`, `PUT`, `PATCH`, or GraphQL mutation
 - the request payload contained at least one unique dummy marker
 - the response status was captured when available
+- redirect chains such as `302 -> 200` are shown when available
 
-## NO Meaning
+It does not prove database persistence.
 
-`NO - NO SERVER SUBMISSION DETECTED` means:
+## NO EVIDENCE Meaning
 
-- no matching request containing the dummy data was detected
+`NO EVIDENCE` means:
 
-This can happen if the frontend is fake, the form only stores locally, the website blocks automation, the submit button is not detected, or the request does not include the dummy markers.
+- the page loaded
+- a supported form field was detected
+- at least one dummy value was filled
+- submit was clicked
+- the monitoring window completed
+- no matching request containing the unique dummy marker was detected
+
+Automation failures are reported as `INCONCLUSIVE`, not `NO EVIDENCE`.
+
+## INCONCLUSIVE Meaning
+
+`INCONCLUSIVE` means the audit could not safely complete. Common reasons:
+
+- page failed to load
+- form could not be found
+- CAPTCHA blocks submission
+- login is required
+- wallet connection or signature is required
+- browser automation failed
 
 ## Database Limitation
 
@@ -60,6 +81,18 @@ From outside the website, we can detect whether dummy data was sent to a server 
 - Do not enter real credentials.
 - The tool only uses generated dummy data.
 
-## Chrome Extension
+## Environment
 
-The repo also includes an optional Chrome extension in `extension/` for manual audits from the browser side panel. The main product flow is the web dashboard.
+Create an environment variable on the server:
+
+```text
+BROWSERLESS_TOKEN=
+```
+
+The token is only read server-side by `app/api/audit/route.ts`.
+
+Optional override for Browserless region or self-hosted endpoint:
+
+```text
+BROWSERLESS_WS_ENDPOINT=wss://production-sfo.browserless.io
+```
