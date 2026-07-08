@@ -1,758 +1,322 @@
 import { randomBytes } from "node:crypto";
-import type { Browser, Frame, Page, Request } from "playwright-core";
+import type { Browser, Page, Request, Response } from "playwright-core";
 import { chromium } from "playwright-core";
+import { validateNavigationUrl } from "@/lib/audit/security";
 
-const POST_SUBMIT_WAIT_MS = 12_000;
 const PAGE_LOAD_TIMEOUT_MS = 25_000;
-const FIELD_FILL_TIMEOUT_MS = 2_500;
+const EVIDENCE_WAIT_MS = 12_000;
+const FILL_TIMEOUT_MS = 2_500;
 const SUBMIT_TIMEOUT_MS = 3_000;
+const OUTBOUND_METHODS = new Set(["POST", "PUT", "PATCH", "GET"]);
+const SECRET_HEADER_PATTERN = /^(authorization|cookie|set-cookie|x-api-key|api-key|proxy-authorization)$/i;
 
-const SUBMISSION_METHODS = new Set(["POST", "PUT", "PATCH"]);
-const FIELD_KEYS = ["xHandle", "wallet", "email", "name"] as const;
-const ANALYTICS_DOMAINS = [
-  "google-analytics.com",
-  "googletagmanager.com",
-  "cloudflareinsights.com",
-  "sentry.io",
-  "segment.io",
-  "mixpanel.com",
-  "amplitude.com",
-  "doubleclick.net",
-];
+export type AuditVerdict =
+  | "CONFIRMED_SENT"
+  | "SENT_BUT_REJECTED"
+  | "NO_SUBMISSION_DETECTED"
+  | "INCONCLUSIVE"
+  | "AUDIT_ERROR";
 
-type FieldKey = (typeof FIELD_KEYS)[number];
+export type FieldKind = "username" | "email" | "xHandle" | "discord" | "telegram" | "evmWallet" | "solanaWallet";
+export type ProgressPercent = 10 | 20 | 35 | 50 | 65 | 75 | 85 | 95 | 100;
 
-export type BrowserlessAuditVerdict = "YES" | "NO_EVIDENCE" | "INCONCLUSIVE";
-
-export interface AuditDummyData {
-  marker: string;
-  xHandle: string;
-  wallet: string;
-  email: string;
-  name: string;
-}
-
-export interface AuditStep {
+export interface AuditProgressEvent {
+  progress: ProgressPercent;
   label: string;
-  status: "done" | "failed" | "skipped";
 }
 
-export interface AuditDebugState {
-  pageLoaded: boolean;
-  formDetected: boolean;
-  fieldsFilledCount: number;
-  submitClicked: boolean;
-  requestsObserved: number;
-  analyticsIgnored: number;
-  relevantRequests: number;
-  matchingRequests: number;
+export interface DetectedField {
+  kind: FieldKind;
+  label: string;
+  required: boolean;
+  selector: string;
 }
 
-export interface StatusChainItem {
-  status: number;
-  url: string;
+export interface AuditDummyData extends Record<FieldKind, string> {
+  runId: string;
+}
+
+export interface RequestEvidence {
+  method: string;
+  endpointDomain: string;
+  endpointPath: string;
+  statusCode: number | null;
+  responseTimeMs: number | null;
+  markersFound: Record<FieldKind, boolean>;
+  sanitizedResponsePreview: string;
 }
 
 export interface BrowserlessAuditResponse {
-  verdict: BrowserlessAuditVerdict;
+  verdict: AuditVerdict;
   message: string;
-  confidence?: "HIGH";
-  auditId: string;
+  runId: string;
   targetUrl: string;
+  detectedFields: DetectedField[];
   dummyData: AuditDummyData;
-  filledFields: Record<FieldKey, boolean>;
-  matchedFields: FieldKey[];
-  request?: {
-    method: string;
-    endpoint: string;
-    endpointDomain: string;
-  };
-  status?: number | null;
-  statusChain?: StatusChainItem[];
+  evidence: RequestEvidence | null;
+  progress: AuditProgressEvent[];
   reason?: string;
-  debug: AuditDebugState;
-  steps: AuditStep[];
 }
 
-interface CandidateField {
-  frameIndex: number;
-  fieldIndex: number;
-  category: FieldKey;
+type ProgressSink = (event: AuditProgressEvent) => void;
+
+interface CandidateField extends DetectedField {
+  index: number;
   score: number;
 }
 
-interface FillableField {
-  index: number;
-  text: string;
-  type: string;
-  visible: boolean;
-  disabled: boolean;
-  readOnly: boolean;
-}
-
-interface SubmitControl {
-  index: number;
-  text: string;
-  type: string;
-  disabled: boolean;
-  visible: boolean;
-  score: number;
-}
-
-interface MatchedRequest {
+interface TrackedRequest {
   request: Request;
-  url: string;
-  method: string;
-  endpointDomain: string;
-  matchedFields: FieldKey[];
-  markerMatched: boolean;
-  timestamp: number;
-  graphqlMutation: boolean;
-  status: number | null;
-  statusChain: StatusChainItem[];
+  startedAt: number;
+  evidence: RequestEvidence;
 }
 
-interface AuditContext {
-  auditId: string;
-  targetUrl: URL;
-  dummyData: AuditDummyData;
-  filledFields: Record<FieldKey, boolean>;
-  steps: AuditStep[];
-  debug: AuditDebugState;
-}
+const FIELD_KINDS: FieldKind[] = ["username", "email", "xHandle", "discord", "telegram", "evmWallet", "solanaWallet"];
 
-export async function runBrowserlessAudit(targetUrl: URL): Promise<BrowserlessAuditResponse> {
-  const auditId = randomBytes(4).toString("hex");
-  const context: AuditContext = {
-    auditId,
-    targetUrl,
-    dummyData: buildDummyData(auditId),
-    filledFields: emptyFilledFields(),
-    steps: [],
-    debug: {
-      pageLoaded: false,
-      formDetected: false,
-      fieldsFilledCount: 0,
-      submitClicked: false,
-      requestsObserved: 0,
-      analyticsIgnored: 0,
-      relevantRequests: 0,
-      matchingRequests: 0,
-    },
+export async function runBrowserlessAudit(targetUrl: URL, onProgress?: ProgressSink): Promise<BrowserlessAuditResponse> {
+  const progress: AuditProgressEvent[] = [];
+  const emit = (progressValue: ProgressPercent, label: string) => {
+    const event = { progress: progressValue, label };
+    progress.push(event);
+    onProgress?.(event);
   };
 
-  const token = process.env.BROWSERLESS_TOKEN;
-  if (!token) {
-    return inconclusive(context, "BROWSERLESS_TOKEN is not configured on the server.");
-  }
-
+  const runId = randomBytes(3).toString("hex");
+  const dummyData = buildDummyData(runId);
   let browser: Browser | null = null;
-  try {
-    browser = await chromium.connectOverCDP(buildBrowserlessEndpoint(token), { timeout: 20_000 });
+  let page: Page | null = null;
+  const tracked = new Map<Request, TrackedRequest>();
+  const matches: TrackedRequest[] = [];
+  let submitted = false;
 
-    const browserContext = browser.contexts()[0] || (await browser.newContext());
-    const page = await browserContext.newPage();
-    const matchedRequests: MatchedRequest[] = [];
-    const requestMap = new Map<Request, MatchedRequest>();
-    const auditStartedAt = Date.now();
+  try {
+    emit(10, "target validated");
+    const token = process.env.BROWSERLESS_TOKEN;
+    if (!token) {
+      emit(100, "complete");
+      return baseReport("AUDIT_ERROR", "Browserless is not configured.", runId, targetUrl, dummyData, progress, [], null, "BROWSERLESS_TOKEN is missing.");
+    }
+
+    browser = await chromium.connectOverCDP(buildBrowserlessEndpoint(token), { timeout: 20_000 });
+    emit(20, "remote browser connected");
+    const context = browser.contexts()[0] || (await browser.newContext());
+    page = await context.newPage();
 
     page.on("request", (request) => {
-      if (Date.now() < auditStartedAt) {
-        return;
-      }
-
-      context.debug.requestsObserved += 1;
-      if (isAnalyticsUrl(request.url())) {
-        context.debug.analyticsIgnored += 1;
-        return;
-      }
-
-      const match = inspectRequest(request, context.dummyData);
-      if (!match) {
-        return;
-      }
-
-      context.debug.relevantRequests += 1;
-      if (!match.markerMatched) {
-        return;
-      }
-
-      matchedRequests.push(match);
-      requestMap.set(request, match);
-      context.debug.matchingRequests = matchedRequests.length;
+      if (!submitted || !OUTBOUND_METHODS.has(request.method().toUpperCase())) return;
+      const evidence = inspectOutboundRequest(request, dummyData);
+      if (!evidence) return;
+      const item = { request, startedAt: Date.now(), evidence };
+      tracked.set(request, item);
+      matches.push(item);
+      emitOnce(progress, emit, 85, "submission observed");
     });
 
-    page.on("response", (response) => {
-      const match = findTrackedMatch(response.request(), requestMap);
-      if (!match) {
-        return;
-      }
-
-      match.statusChain.push({
-        status: response.status(),
-        url: response.url(),
-      });
-      match.status = match.status ?? response.status();
+    page.on("response", async (response) => {
+      const item = tracked.get(response.request());
+      if (!item) return;
+      item.evidence.statusCode = response.status();
+      item.evidence.responseTimeMs = Date.now() - item.startedAt;
+      item.evidence.sanitizedResponsePreview = await sanitizedPreview(response);
     });
 
-    mark(context, "Opening page", "done");
-    const loaded = await openTarget(page, targetUrl);
-    if (!loaded.ok) {
-      mark(context, "Opening page", "failed");
-      return inconclusive(context, loaded.reason || "Page failed to load.");
-    }
-    context.debug.pageLoaded = true;
+    page.on("framenavigated", (frame) => {
+      if (frame === page?.mainFrame()) validateNavigationUrl(frame.url());
+    });
 
-    const blockerBeforeFill = await detectBlocker(page);
-    if (blockerBeforeFill) {
-      mark(context, "Detecting form", "failed");
-      return inconclusive(context, blockerBeforeFill);
-    }
+    await page.goto(targetUrl.toString(), { waitUntil: "domcontentloaded", timeout: PAGE_LOAD_TIMEOUT_MS });
+    await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => {});
+    emit(35, "page loaded");
 
-    const filled = await fillDetectedFields(page, context.dummyData);
-    context.debug.formDetected = filled.formDetected;
-    context.debug.fieldsFilledCount = filled.filledFields.length;
-    context.filledFields = toFilledFields(filled.filledFields);
+    const blocker = await detectBlocker(page);
+    if (blocker) { emitOnce(progress, emit, 100, "complete"); return inconclusive(runId, targetUrl, dummyData, progress, blocker); }
 
-    if (!filled.formDetected) {
-      mark(context, "Detecting form", "failed");
-      return inconclusive(context, "No supported form field was detected.");
-    }
-    mark(context, "Detecting form", "done");
+    const fields = await detectRequiredFields(page);
+    emit(50, "fields detected");
+    if (fields.length === 0) { emitOnce(progress, emit, 100, "complete"); return inconclusive(runId, targetUrl, dummyData, progress, "No visible required supported form fields were detected."); }
 
-    if (filled.filledFields.length === 0) {
-      mark(context, "Filling dummy data", "failed");
-      return inconclusive(context, "Supported fields were found, but dummy data could not be filled.");
-    }
-    mark(context, "Filling dummy data", "done");
+    emit(65, "dummy data prepared");
+    const filled = await fillFields(page, fields, dummyData);
+    if (filled === 0) { emitOnce(progress, emit, 100, "complete"); return inconclusive(runId, targetUrl, dummyData, progress, "Detected fields could not be filled."); }
+    emit(75, "form filled");
 
     const blockerBeforeSubmit = await detectBlocker(page);
-    if (blockerBeforeSubmit) {
-      mark(context, "Submitting", "failed");
-      return inconclusive(context, blockerBeforeSubmit);
+    if (blockerBeforeSubmit) { emitOnce(progress, emit, 100, "complete"); return inconclusive(runId, targetUrl, dummyData, progress, blockerBeforeSubmit); }
+
+    submitted = true;
+    const clicked = await submitOnce(page);
+    if (!clicked) { emitOnce(progress, emit, 100, "complete"); return inconclusive(runId, targetUrl, dummyData, progress, "No safe submit control was detected."); }
+
+    await page.waitForTimeout(EVIDENCE_WAIT_MS);
+    const winner = matches[0]?.evidence || null;
+    emit(95, "response analyzed");
+    emit(100, "complete");
+
+    if (!winner) {
+      return baseReport("NO_SUBMISSION_DETECTED", "Submit was triggered, but no outbound request containing a dummy marker was observed.", runId, targetUrl, dummyData, progress, fields, null);
     }
 
-    const submitted = await clickSubmit(page);
-    if (!submitted.ok) {
-      mark(context, "Submitting", "failed");
-      return inconclusive(context, submitted.reason || "No supported submit button was detected.");
-    }
-
-    context.debug.submitClicked = true;
-    mark(context, "Submitting", "done");
-
-    await page.waitForTimeout(POST_SUBMIT_WAIT_MS);
-    mark(context, "Inspecting requests", "done");
-
-    const winner = matchedRequests[0];
-    if (winner) {
-      mark(context, "Result", "done");
-      return {
-        verdict: "YES",
-        message: "DATA SENT TO SERVER",
-        confidence: "HIGH",
-        auditId,
-        targetUrl: targetUrl.toString(),
-        dummyData: context.dummyData,
-        filledFields: context.filledFields,
-        matchedFields: winner.matchedFields,
-        request: {
-          method: winner.method,
-          endpoint: winner.url,
-          endpointDomain: winner.endpointDomain,
-        },
-        status: winner.status,
-        statusChain: winner.statusChain,
-        debug: context.debug,
-        steps: context.steps,
-      };
-    }
-
-    mark(context, "Result", "done");
-    return {
-      verdict: "NO_EVIDENCE",
-      message: "No matching server submission detected.",
-      auditId,
-      targetUrl: targetUrl.toString(),
-      dummyData: context.dummyData,
-      filledFields: context.filledFields,
-      matchedFields: [],
-      debug: context.debug,
-      steps: context.steps,
-    };
+    const status = winner.statusCode;
+    const rejected = typeof status === "number" && (status >= 400 || status === 0);
+    return baseReport(
+      rejected ? "SENT_BUT_REJECTED" : "CONFIRMED_SENT",
+      rejected ? "A dummy marker left the browser, but the target returned a rejection or error response." : "A unique dummy marker was detected in an outbound request.",
+      runId,
+      targetUrl,
+      dummyData,
+      progress,
+      fields,
+      winner,
+    );
   } catch (error) {
-    return inconclusive(context, error instanceof Error ? error.message : "Browser automation failed.");
+    emitOnce(progress, emit, 100, "complete");
+    return baseReport("AUDIT_ERROR", "The auditor failed before it could produce reliable evidence.", runId, targetUrl, dummyData, progress, [], null, error instanceof Error ? error.message : "Internal audit error.");
   } finally {
+    await page?.close().catch(() => {});
     await browser?.close().catch(() => {});
   }
 }
 
-function buildBrowserlessEndpoint(token: string) {
-  if (process.env.BROWSERLESS_WS_ENDPOINT) {
-    const endpoint = new URL(process.env.BROWSERLESS_WS_ENDPOINT);
-    if (!endpoint.searchParams.has("token")) {
-      endpoint.searchParams.set("token", token);
-    }
-    return endpoint.toString();
-  }
+function baseReport(verdict: AuditVerdict, message: string, runId: string, targetUrl: URL, dummyData: AuditDummyData, progress: AuditProgressEvent[], detectedFields: DetectedField[], evidence: RequestEvidence | null, reason?: string): BrowserlessAuditResponse {
+  return { verdict, message, runId, targetUrl: targetUrl.toString(), detectedFields, dummyData, evidence, progress, reason };
+}
 
-  const endpoint = new URL("wss://production-sfo.browserless.io");
-  endpoint.searchParams.set("token", token);
+function inconclusive(runId: string, targetUrl: URL, dummyData: AuditDummyData, progress: AuditProgressEvent[], reason: string) {
+  emitComplete(progress);
+  return baseReport("INCONCLUSIVE", "The audit could not reach a reliable conclusion.", runId, targetUrl, dummyData, progress, [], null, reason);
+}
+
+function emitComplete(progress: AuditProgressEvent[]) {
+  if (!progress.some((event) => event.progress === 100)) progress.push({ progress: 100, label: "complete" });
+}
+function emitOnce(events: AuditProgressEvent[], emit: (progress: ProgressPercent, label: string) => void, progress: ProgressPercent, label: string) {
+  if (!events.some((event) => event.progress === progress)) emit(progress, label);
+}
+
+function buildDummyData(runId: string): AuditDummyData {
+  return {
+    runId,
+    username: `audit_${runId}`,
+    email: `audit-${runId}@example.com`,
+    xHandle: `@audit_${runId}`,
+    discord: `audit_${runId}`,
+    telegram: `audit_${runId}`,
+    evmWallet: `0x${runId.padEnd(40, "a")}`,
+    solanaWallet: `${runId}${"So11111111111111111111111111111111111111112".slice(runId.length)}`,
+  };
+}
+
+function buildBrowserlessEndpoint(token: string) {
+  const endpoint = new URL(process.env.BROWSERLESS_WS_URL || "wss://production-sfo.browserless.io");
+  if (!endpoint.searchParams.has("token")) endpoint.searchParams.set("token", token);
   return endpoint.toString();
 }
 
-async function openTarget(page: Page, targetUrl: URL) {
-  try {
-    await page.goto(targetUrl.toString(), {
-      waitUntil: "domcontentloaded",
-      timeout: PAGE_LOAD_TIMEOUT_MS,
-    });
-    await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => {});
-    return { ok: true };
-  } catch (error) {
+async function detectRequiredFields(page: Page): Promise<DetectedField[]> {
+  const raw = await page.locator("input, textarea").evaluateAll((elements) => elements.map((element, index) => {
+    const input = element as HTMLInputElement | HTMLTextAreaElement;
+    const rect = input.getBoundingClientRect();
+    const style = window.getComputedStyle(input);
+    const id = input.id || "";
+    const label = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`)?.textContent || "" : "";
     return {
-      ok: false,
-      reason: error instanceof Error ? `Page failed to load: ${error.message}` : "Page failed to load.",
+      index,
+      selector: `input, textarea >> nth=${index}`,
+      required: input.required || input.getAttribute("aria-required") === "true",
+      type: (input.getAttribute("type") || input.tagName || "text").toLowerCase(),
+      label: [label, input.closest("label")?.textContent || "", input.getAttribute("name") || "", input.id || "", input.getAttribute("placeholder") || "", input.getAttribute("autocomplete") || "", input.getAttribute("aria-label") || ""].join(" ").trim(),
+      visible: rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none",
+      disabled: input.disabled,
+      readOnly: input.readOnly,
     };
-  }
-}
+  }));
 
-async function fillDetectedFields(page: Page, dummyData: AuditDummyData) {
-  const frames = page.frames();
   const candidates: CandidateField[] = [];
-  const fieldsByFrame: FillableField[][] = [];
-
-  for (let frameIndex = 0; frameIndex < frames.length; frameIndex += 1) {
-    const fields = await getFillableFields(frames[frameIndex]).catch(() => [] as FillableField[]);
-    fieldsByFrame.push(fields);
-    for (const field of fields) {
-      for (const category of FIELD_KEYS) {
-        const score = scoreField(field, category);
-        if (score > 0) {
-          candidates.push({ frameIndex, fieldIndex: field.index, category, score });
-        }
-      }
+  for (const field of raw) {
+    if (!field.required || !field.visible || field.disabled || field.readOnly) continue;
+    if (!["", "text", "email", "url", "search", "textarea"].includes(field.type)) continue;
+    for (const kind of FIELD_KINDS) {
+      const score = scoreField(`${field.type} ${field.label}`.toLowerCase(), kind);
+      if (score > 0) candidates.push({ kind, label: field.label || kind, required: true, selector: field.selector, index: field.index, score });
     }
   }
 
-  const filledFields: FieldKey[] = [];
-  const usedDomFields = new Set<string>();
-  const usedCategories = new Set<FieldKey>();
+  const usedKinds = new Set<FieldKind>();
+  const usedIndexes = new Set<number>();
+  return candidates.sort((a, b) => b.score - a.score).filter((candidate) => {
+    if (usedKinds.has(candidate.kind) || usedIndexes.has(candidate.index)) return false;
+    usedKinds.add(candidate.kind);
+    usedIndexes.add(candidate.index);
+    return true;
+  });
+}
 
-  for (const candidate of candidates.sort((a, b) => b.score - a.score)) {
-    const fieldKey = `${candidate.frameIndex}:${candidate.fieldIndex}`;
-    if (usedDomFields.has(fieldKey) || usedCategories.has(candidate.category)) {
-      continue;
-    }
-
-    const filled = await frames[candidate.frameIndex]
-      .locator("input, textarea")
-      .nth(candidate.fieldIndex)
-      .fill(dummyData[candidate.category], { timeout: FIELD_FILL_TIMEOUT_MS })
-      .then(() => true)
-      .catch(() => false);
-
-    if (filled) {
-      usedDomFields.add(fieldKey);
-      usedCategories.add(candidate.category);
-      filledFields.push(candidate.category);
-    }
-  }
-
-  return {
-    formDetected: candidates.length > 0,
-    fieldsDetectedCount: candidates.length,
-    filledFields,
-    fieldsByFrame,
+function scoreField(text: string, kind: FieldKind) {
+  const patterns: Record<FieldKind, RegExp[]> = {
+    username: [/user\s*name|username|name/],
+    email: [/\bemail\b|e-mail/],
+    xHandle: [/x\/twitter|twitter|x handle|\bx\b|handle/],
+    discord: [/discord/],
+    telegram: [/telegram|\btg\b/],
+    evmWallet: [/evm|ethereum|wallet|0x|address/],
+    solanaWallet: [/solana|\bsol\b|wallet|address/],
   };
+  if (kind === "email" && text.includes("email")) return 30;
+  const index = patterns[kind].findIndex((pattern) => pattern.test(text));
+  return index === -1 ? 0 : 20 - index;
 }
 
-async function getFillableFields(frame: Frame): Promise<FillableField[]> {
-  return frame.locator("input, textarea").evaluateAll((elements) =>
-    elements.map((element, index) => {
-      const input = element as HTMLInputElement | HTMLTextAreaElement;
-      const rect = input.getBoundingClientRect();
-      const style = window.getComputedStyle(input);
-      const id = input.id || "";
-      let forLabel = "";
-      try {
-        forLabel = id
-          ? document.querySelector(`label[for="${CSS.escape(id)}"]`)?.textContent || ""
-          : "";
-      } catch {
-        forLabel = "";
-      }
-
-      const nearby = [
-        input.closest("label")?.textContent || "",
-        input.parentElement?.textContent || "",
-        input.parentElement?.previousElementSibling?.textContent || "",
-      ].join(" ");
-
-      return {
-        index,
-        type: "type" in input ? (input.type || "text").toLowerCase() : "textarea",
-        text: [
-          input.getAttribute("name") || "",
-          input.id || "",
-          input.getAttribute("placeholder") || "",
-          input.getAttribute("aria-label") || "",
-          forLabel,
-          nearby,
-        ]
-          .join(" ")
-          .toLowerCase(),
-        disabled: input.disabled,
-        readOnly: input.readOnly,
-        visible:
-          rect.width > 0 &&
-          rect.height > 0 &&
-          style.visibility !== "hidden" &&
-          style.display !== "none",
-      };
-    }),
-  );
+async function fillFields(page: Page, fields: DetectedField[], dummyData: AuditDummyData) {
+  let filled = 0;
+  for (const field of fields) {
+    const index = Number(field.selector.split("nth=")[1]);
+    const ok = await page.locator("input, textarea").nth(index).fill(dummyData[field.kind], { timeout: FILL_TIMEOUT_MS }).then(() => true).catch(() => false);
+    if (ok) filled += 1;
+  }
+  return filled;
 }
 
-function scoreField(field: FillableField, category: FieldKey) {
-  if (!field.visible || field.disabled || field.readOnly) {
-    return 0;
-  }
-
-  const textTypes = new Set(["", "text", "search", "url", "email", "tel", "textarea"]);
-  if (!textTypes.has(field.type)) {
-    return 0;
-  }
-
-  if (category === "email" && field.type === "email") {
-    return 20;
-  }
-
-  const patterns: Record<FieldKey, RegExp[]> = {
-    xHandle: [/\bx handle\b/i, /\bx username\b/i, /\btwitter\b/i, /\bhandle\b/i],
-    wallet: [/\bwallet address\b/i, /\bevm address\b/i, /\bwallet\b/i, /\baddress\b/i, /\b0x\b/i],
-    email: [/\be-mail\b/i, /\bemail\b/i],
-    name: [/\bfull name\b/i, /\bname\b/i],
-  };
-
-  const matchIndex = patterns[category].findIndex((pattern) => pattern.test(field.text));
-  return matchIndex === -1 ? 0 : 15 - matchIndex;
-}
-
-async function clickSubmit(page: Page) {
-  const frames = page.frames();
-  for (const frame of frames) {
-    const quickButton = frame
-      .locator('button, input[type="submit"], input[type="button"], [role="button"]')
-      .filter({ hasText: submitButtonNamePattern })
-      .first();
-
-    const clicked = await quickButton
-      .click({ timeout: SUBMIT_TIMEOUT_MS })
-      .then(() => true)
-      .catch(() => false);
-    if (clicked) {
-      return { ok: true };
-    }
-  }
-
-  for (const frame of frames) {
-    const controls = await getSubmitControls(frame).catch(() => [] as SubmitControl[]);
-    const preferred = controls
-      .filter((control) => control.visible && !control.disabled && control.score > 0)
-      .filter((control) => !unsafeActionPattern.test(control.text))
-      .sort((a, b) => b.score - a.score)[0];
-
-    if (!preferred) {
-      continue;
-    }
-
-    const clicked = await frame
-      .locator('button, input[type="submit"], input[type="button"], [role="button"]')
-      .nth(preferred.index)
-      .click({ timeout: SUBMIT_TIMEOUT_MS })
-      .then(() => true)
-      .catch(() => false);
-    if (clicked) {
-      return { ok: true };
-    }
-
-    const dispatched = await frame
-      .locator('button, input[type="submit"], input[type="button"], [role="button"]')
-      .nth(preferred.index)
-      .evaluate((element) => {
-        element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
-        element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
-        element.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
-      })
-      .then(() => true)
-      .catch(() => false);
-    if (dispatched) {
-      return { ok: true };
-    }
-  }
-
-  const blocker = await detectBlocker(page);
-  return { ok: false, reason: blocker || "No supported submit button was detected." };
-}
-
-async function getSubmitControls(frame: Frame): Promise<SubmitControl[]> {
-  return frame
-    .locator('button, input[type="submit"], input[type="button"], [role="button"]')
-    .evaluateAll((elements) =>
-      elements.map((element, index) => {
-        const rect = element.getBoundingClientRect();
-        const style = window.getComputedStyle(element);
-        const input = element as HTMLInputElement;
-        const type = input.type || element.getAttribute("type") || "";
-        const text = [
-          element.textContent || "",
-          input.value || "",
-          element.getAttribute("aria-label") || "",
-          element.getAttribute("title") || "",
-        ]
-          .join(" ")
-          .trim()
-          .toLowerCase();
-
-        const textScore = submitPatterns.reduce((score, pattern, patternIndex) => {
-          return pattern.test(text) ? Math.max(score, 20 - patternIndex) : score;
-        }, 0);
-
-        return {
-          index,
-          text,
-          type: type.toLowerCase(),
-          disabled: input.disabled || element.getAttribute("aria-disabled") === "true",
-          visible:
-            rect.width > 0 &&
-            rect.height > 0 &&
-            style.visibility !== "hidden" &&
-            style.display !== "none",
-          score: textScore + (type.toLowerCase() === "submit" ? 10 : 0),
-        };
-      }),
-    );
+async function submitOnce(page: Page) {
+  const locator = page.locator('button[type="submit"], input[type="submit"], button, [role="button"]').filter({ hasText: /submit|join|apply|send|register|sign up|continue/i }).first();
+  return locator.click({ timeout: SUBMIT_TIMEOUT_MS }).then(() => true).catch(async () => {
+    return page.locator("form").first().evaluate((form) => (form as HTMLFormElement).requestSubmit()).then(() => true).catch(() => false);
+  });
 }
 
 async function detectBlocker(page: Page) {
-  const text = await page
-    .locator("body")
-    .innerText({ timeout: 2_000 })
-    .then((value) => value.toLowerCase())
-    .catch(() => "");
-
-  const frameUrls = page.frames().map((frame) => frame.url().toLowerCase()).join(" ");
-  const combined = `${text} ${frameUrls}`;
-
-  if (/captcha|recaptcha|hcaptcha|turnstile|cf-challenge/.test(combined)) {
-    return "CAPTCHA blocks submission.";
-  }
-  if (/\blog in\b|\blogin\b|\bsign in\b/.test(combined)) {
-    return "Login is required.";
-  }
-  if (/connect wallet|walletconnect|metamask|sign message|signature required|sign transaction/.test(combined)) {
-    return "Wallet connection or signature is required.";
-  }
-
+  const text = await page.locator("body").innerText({ timeout: 2_000 }).then((value) => value.toLowerCase()).catch(() => "");
+  if (/captcha|recaptcha|hcaptcha|turnstile|cf-challenge/.test(text)) return "CAPTCHA or bot challenge prevented a conclusion.";
+  if (/\blog in\b|\blogin\b|\bsign in\b/.test(text)) return "Login prevented a conclusion.";
+  if (/connect wallet|walletconnect|metamask|sign message|signature required|sign transaction/.test(text)) return "Wallet signature or access control prevented a conclusion.";
   return "";
 }
 
-function inspectRequest(request: Request, dummyData: AuditDummyData): MatchedRequest | null {
-  const searchableText = buildSearchableRequestText(request);
-  const graphqlMutation = /\bmutation\b/i.test(searchableText);
-  const method = request.method().toUpperCase();
+function inspectOutboundRequest(request: Request, dummyData: AuditDummyData): RequestEvidence | null {
+  const text = searchableRequestText(request);
+  const markersFound = Object.fromEntries(FIELD_KINDS.map((kind) => [kind, includesMarker(text, dummyData[kind])])) as Record<FieldKind, boolean>;
+  if (!Object.values(markersFound).some(Boolean)) return null;
+  const url = new URL(request.url());
+  return { method: request.method().toUpperCase(), endpointDomain: url.hostname, endpointPath: `${url.pathname}${url.search}`, statusCode: null, responseTimeMs: null, markersFound, sanitizedResponsePreview: "" };
+}
 
-  if (!SUBMISSION_METHODS.has(method) && !graphqlMutation) {
-    return null;
+function searchableRequestText(request: Request) {
+  const parts = [request.url(), request.postData() || ""];
+  const post = request.postData() || "";
+  try { parts.push(decodeURIComponent(post)); } catch {}
+  try { parts.push(JSON.stringify(request.postDataJSON())); } catch {}
+  return parts.join("\n").toLowerCase();
+}
+
+function includesMarker(text: string, marker: string) {
+  const lower = marker.toLowerCase();
+  return text.includes(lower) || text.includes(encodeURIComponent(marker).toLowerCase());
+}
+
+async function sanitizedPreview(response: Response) {
+  for (const name of Object.keys(response.headers())) {
+    if (SECRET_HEADER_PATTERN.test(name)) return "[response preview withheld because sensitive headers were present]";
   }
-
-  const matchedFields = detectMatchedFields(searchableText, dummyData);
-  const markerMatched = markerVariants(dummyData.marker).some((variant) => searchableText.includes(variant));
-
-  return {
-    request,
-    url: request.url(),
-    method,
-    endpointDomain: safeDomain(request.url()),
-    matchedFields,
-    markerMatched,
-    timestamp: Date.now(),
-    graphqlMutation,
-    status: null,
-    statusChain: [],
-  };
+  const contentType = response.headers()["content-type"] || "";
+  if (!/json|text|html|xml|plain/i.test(contentType)) return "[non-text response omitted]";
+  return response.text().then((body) => body.replace(/(authorization|cookie|set-cookie|api[_-]?key|token|secret)[^\n,}]*/gi, "$1=[redacted]").slice(0, 600)).catch(() => "");
 }
-
-function buildSearchableRequestText(request: Request) {
-  const parts = new Set<string>();
-  addDecodedVariants(parts, request.url());
-
-  const requestUrl = safeCall(() => new URL(request.url()));
-  if (requestUrl) {
-    for (const [key, value] of requestUrl.searchParams.entries()) {
-      addDecodedVariants(parts, key);
-      addDecodedVariants(parts, value);
-    }
-  }
-
-  const postData = safeCall(() => request.postData()) || "";
-  addDecodedVariants(parts, postData);
-  addFormUrlEncodedParts(parts, postData);
-
-  const postDataBuffer = safeCall(() => request.postDataBuffer());
-  if (postDataBuffer) {
-    const bufferText = Buffer.from(postDataBuffer).toString("utf8");
-    addDecodedVariants(parts, bufferText);
-    addFormUrlEncodedParts(parts, bufferText);
-  }
-
-  const postDataJson = safeCall(() => request.postDataJSON());
-  if (postDataJson) {
-    addDecodedVariants(parts, JSON.stringify(postDataJson));
-  }
-
-  return Array.from(parts).join("\n");
-}
-
-function addFormUrlEncodedParts(parts: Set<string>, value: string) {
-  if (!value || !value.includes("=")) {
-    return;
-  }
-
-  try {
-    for (const [key, fieldValue] of new URLSearchParams(value).entries()) {
-      addDecodedVariants(parts, key);
-      addDecodedVariants(parts, fieldValue);
-    }
-  } catch {
-    return;
-  }
-}
-
-function addDecodedVariants(parts: Set<string>, value: string) {
-  if (!value) {
-    return;
-  }
-
-  parts.add(value);
-  parts.add(value.replace(/\+/g, " "));
-
-  let decoded = value;
-  for (let index = 0; index < 2; index += 1) {
-    try {
-      decoded = decodeURIComponent(decoded);
-      parts.add(decoded);
-      parts.add(decoded.replace(/\+/g, " "));
-    } catch {
-      break;
-    }
-  }
-}
-
-function detectMatchedFields(text: string, dummyData: AuditDummyData): FieldKey[] {
-  return FIELD_KEYS.filter((key) => markerVariants(dummyData[key]).some((variant) => text.includes(variant)));
-}
-
-function markerVariants(value: string) {
-  return [value, encodeURIComponent(value), encodeURI(value), value.replace(/\s/g, "+")];
-}
-
-function findTrackedMatch(request: Request, requestMap: Map<Request, MatchedRequest>) {
-  let current: Request | null = request;
-  while (current) {
-    const match = requestMap.get(current);
-    if (match) {
-      return match;
-    }
-    current = current.redirectedFrom();
-  }
-  return null;
-}
-
-function isAnalyticsUrl(url: string) {
-  const hostname = safeDomain(url).replace(/^www\./, "");
-  return ANALYTICS_DOMAINS.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
-}
-
-function safeDomain(url: string) {
-  try {
-    return new URL(url).hostname.toLowerCase();
-  } catch {
-    return "";
-  }
-}
-
-function safeCall<T>(callback: () => T) {
-  try {
-    return callback();
-  } catch {
-    return null;
-  }
-}
-
-function buildDummyData(auditId: string): AuditDummyData {
-  return {
-    marker: auditId,
-    xHandle: `audit_x_${auditId}`,
-    wallet: `0x${"1".repeat(32)}${auditId}`,
-    email: `audit_${auditId}@example.invalid`,
-    name: `Audit ${auditId}`,
-  };
-}
-
-function emptyFilledFields(): Record<FieldKey, boolean> {
-  return {
-    xHandle: false,
-    wallet: false,
-    email: false,
-    name: false,
-  };
-}
-
-function toFilledFields(fields: FieldKey[]) {
-  const filledFields = emptyFilledFields();
-  for (const field of fields) {
-    filledFields[field] = true;
-  }
-  return filledFields;
-}
-
-function inconclusive(context: AuditContext, reason: string): BrowserlessAuditResponse {
-  mark(context, "Result", "failed");
-  return {
-    verdict: "INCONCLUSIVE",
-    message: "COULDN'T VERIFY",
-    auditId: context.auditId,
-    targetUrl: context.targetUrl.toString(),
-    dummyData: context.dummyData,
-    filledFields: context.filledFields,
-    matchedFields: [],
-    reason,
-    debug: context.debug,
-    steps: context.steps,
-  };
-}
-
-function mark(context: AuditContext, label: string, status: AuditStep["status"]) {
-  const existing = context.steps.find((step) => step.label === label);
-  if (existing) {
-    existing.status = status;
-    return;
-  }
-
-  context.steps.push({ label, status });
-}
-
-const submitPatterns = [
-  /\bjoin apelist\b/i,
-  /\bjoin whitelist\b/i,
-  /\bjoin waitlist\b/i,
-  /\bsubmit\b/i,
-  /\bapply\b/i,
-  /\bregister\b/i,
-  /\bsend\b/i,
-  /\bjoin\b/i,
-];
-const submitButtonNamePattern = /join apelist|join whitelist|join waitlist|submit|apply|register|send|join/i;
-const unsafeActionPattern = /\b(connect|metamask|walletconnect|sign message|signature|transaction)\b/i;

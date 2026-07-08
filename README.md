@@ -94,5 +94,5 @@ The token is only read server-side by `app/api/audit/route.ts`.
 Optional override for Browserless region or self-hosted endpoint:
 
 ```text
-BROWSERLESS_WS_ENDPOINT=wss://production-sfo.browserless.io
+BROWSERLESS_WS_URL=wss://production-sfo.browserless.io
 ```
