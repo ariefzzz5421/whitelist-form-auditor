@@ -1,4 +1,4 @@
-import puppeteer from "puppeteer-core";
+import { chromium, type Browser } from "playwright-core";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -23,14 +23,21 @@ export async function GET() {
   const endpoint = new URL(baseUrl);
   endpoint.searchParams.set("token", token);
 
-  let browser;
+  let browser: Browser | null = null;
 
   try {
-    browser = await puppeteer.connect({
-      browserWSEndpoint: endpoint.toString(),
-    });
+    browser = await chromium.connectOverCDP(
+      endpoint.toString(),
+      {
+        timeout: 20_000,
+      },
+    );
 
-    const page = await browser.newPage();
+    const context =
+      browser.contexts()[0] ??
+      (await browser.newContext());
+
+    const page = await context.newPage();
 
     await page.goto("https://example.com", {
       waitUntil: "domcontentloaded",
@@ -45,6 +52,8 @@ export async function GET() {
       message: "Browserless connection works",
     });
   } catch (error) {
+    console.error("Browserless test failed:", error);
+
     return Response.json(
       {
         ok: false,
@@ -56,8 +65,6 @@ export async function GET() {
       { status: 500 },
     );
   } finally {
-    if (browser) {
-      await browser.close();
-    }
+    await browser?.close().catch(() => {});
   }
 }
