@@ -76,19 +76,52 @@ export async function validatePublicTargetUrl(rawUrl: unknown) {
   return url;
 }
 
+export function validateNavigationUrl(rawUrl: string) {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new UrlValidationError("Unsafe redirect destination was blocked.");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new UrlValidationError("Unsafe redirect destination was blocked.");
+  }
+  const hostname = normalizeHostname(url.hostname);
+  if (
+    BLOCKED_HOSTNAMES.has(hostname) ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal")
+  ) {
+    throw new UrlValidationError("Unsafe redirect destination was blocked.");
+  }
+  if (net.isIP(hostname)) {
+    assertPublicIp(hostname);
+  }
+  return url;
+}
+
 export async function fetchTargetHtml(url: URL) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), STATIC_FETCH_TIMEOUT_MS);
 
   try {
     const response = await fetch(url.toString(), {
-      redirect: "follow",
+      redirect: "manual",
       signal: controller.signal,
       headers: {
         accept: "text/html,application/xhtml+xml,text/plain;q=0.8,*/*;q=0.5",
         "user-agent": "WhitelistFormAuditor/1.0 (+https://local.audit)",
       },
     });
+
+    if (isRedirectStatus(response.status)) {
+      const location = response.headers.get("location");
+      if (!location) throw new Error("Target redirected without a Location header.");
+      const nextUrl = new URL(location, url);
+      await validatePublicTargetUrl(nextUrl.toString());
+      return fetchTargetHtml(nextUrl);
+    }
 
     if (!response.ok) {
       throw new Error(`Target returned HTTP ${response.status}.`);
@@ -229,4 +262,8 @@ async function readLimitedText(response: Response, byteLimit: number) {
   }
 
   return new TextDecoder().decode(combined);
+}
+
+function isRedirectStatus(status: number) {
+  return status >= 300 && status < 400;
 }

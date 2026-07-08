@@ -1,127 +1,38 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
-import { getStatusMeaning } from "@/lib/audit/status-meaning";
+import { FormEvent, useMemo, useState } from "react";
+import { STATUS_CODE_LAB } from "@/lib/audit/status-meaning";
 
-type Verdict = "YES" | "NO_EVIDENCE" | "INCONCLUSIVE";
-type FieldKey = "xHandle" | "wallet" | "email" | "name";
-type StepStatus = "done" | "failed" | "skipped";
-type VisibleStepStatus = StepStatus | "pending" | "active";
+type Verdict = "CONFIRMED_SENT" | "SENT_BUT_REJECTED" | "NO_SUBMISSION_DETECTED" | "INCONCLUSIVE" | "AUDIT_ERROR";
+type FieldKind = "username" | "email" | "xHandle" | "discord" | "telegram" | "evmWallet" | "solanaWallet";
 
-interface StatusChainItem {
-  status: number;
-  url: string;
-}
+interface ProgressEvent { progress: number; label: string; }
+interface DetectedField { kind: FieldKind; label: string; required: boolean; }
+interface Evidence { method: string; endpointDomain: string; endpointPath: string; statusCode: number | null; responseTimeMs: number | null; markersFound: Record<FieldKind, boolean>; sanitizedResponsePreview: string; }
+interface AuditResponse { verdict: Verdict; message: string; runId: string; targetUrl: string; detectedFields: DetectedField[]; dummyData: Record<FieldKind | "runId", string>; evidence: Evidence | null; progress: ProgressEvent[]; reason?: string; }
 
-interface AuditStep {
-  label: string;
-  status: StepStatus;
-}
-
-interface AuditResponse {
-  verdict: Verdict;
-  message: string;
-  confidence?: "HIGH";
-  auditId: string;
-  targetUrl: string;
-  dummyData: Record<FieldKey | "marker", string>;
-  filledFields: Record<FieldKey, boolean>;
-  matchedFields: FieldKey[];
-  request?: {
-    method: string;
-    endpoint: string;
-    endpointDomain: string;
-  };
-  status?: number | null;
-  statusChain?: StatusChainItem[];
-  reason?: string;
-  debug: {
-    pageLoaded: boolean;
-    formDetected: boolean;
-    fieldsFilledCount: number;
-    submitClicked: boolean;
-    requestsObserved: number;
-    analyticsIgnored: number;
-    relevantRequests: number;
-    matchingRequests: number;
-  };
-  steps: AuditStep[];
-}
-
-const PROGRESS_STEPS = [
-  "Opening page",
-  "Detecting form",
-  "Filling dummy data",
-  "Submitting",
-  "Inspecting requests",
-  "Result",
-];
-
-const FIELD_KEYS: FieldKey[] = ["xHandle", "wallet", "email", "name"];
-const STUDY_STATUSES = [200, 201, 202, 204, 301, 302, 307, 308, 400, 401, 403, 404, 429, 500, 502, 503, 504];
-
-const FIELD_LABELS: Record<FieldKey, string> = {
-  xHandle: "X Handle",
-  wallet: "Wallet",
-  email: "Email",
-  name: "Name",
-};
+const FIELD_LABELS: Record<FieldKind, string> = { username: "Username", email: "Email", xHandle: "X/Twitter", discord: "Discord", telegram: "Telegram", evmWallet: "EVM wallet", solanaWallet: "Solana wallet" };
+const FIELD_KEYS = Object.keys(FIELD_LABELS) as FieldKind[];
 
 export default function AuditorClient() {
   const [targetUrl, setTargetUrl] = useState("");
   const [report, setReport] = useState<AuditResponse | null>(null);
+  const [events, setEvents] = useState<ProgressEvent[]>([]);
   const [loading, setLoading] = useState(false);
-  const [loadingIndex, setLoadingIndex] = useState(0);
   const [error, setError] = useState("");
-
   const formattedUrl = useMemo(() => normalizeUrl(targetUrl), [targetUrl]);
-  const hasInput = targetUrl.trim().length > 0;
-
-  useEffect(() => {
-    if (!loading) return;
-
-    const timer = window.setInterval(() => {
-      setLoadingIndex((value) => Math.min(value + 1, PROGRESS_STEPS.length - 1));
-    }, 2_200);
-
-    return () => window.clearInterval(timer);
-  }, [loading]);
-
-  const visibleSteps = useMemo<Array<{ label: string; status: VisibleStepStatus }>>(() => {
-    if (report?.steps?.length) {
-      return PROGRESS_STEPS.map((label) => {
-        const existing = report.steps.find((step) => step.label === label);
-        return { label, status: existing?.status || "skipped" };
-      });
-    }
-
-    return PROGRESS_STEPS.map((label, index) => ({
-      label,
-      status: index < loadingIndex ? "done" : index === loadingIndex && loading ? "active" : "pending",
-    }));
-  }, [loading, loadingIndex, report]);
 
   async function runAudit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setError("");
-    setReport(null);
-    setLoadingIndex(0);
-    setTargetUrl(formattedUrl);
-    setLoading(true);
-
+    setLoading(true); setError(""); setReport(null); setEvents([]);
     try {
-      const response = await fetch("/api/audit", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ url: formattedUrl }),
+      const response = await fetch("/api/audit", { method: "POST", headers: { "content-type": "application/json", accept: "text/event-stream" }, body: JSON.stringify({ url: formattedUrl, stream: true }) });
+      if (!response.ok || !response.body) throw new Error((await response.json().catch(() => null))?.error || "Audit failed.");
+      await readEventStream(response.body, (type, data) => {
+        if (type === "progress") setEvents((current) => [...current, data as ProgressEvent]);
+        if (type === "complete") setReport(data as AuditResponse);
+        if (type === "error") throw new Error((data as { error?: string }).error || "Audit failed.");
       });
-      const payload = await response.json();
-
-      if (!response.ok) {
-        throw new Error(payload?.error || "Audit failed.");
-      }
-
-      setReport(payload as AuditResponse);
     } catch (auditError) {
       setError(auditError instanceof Error ? auditError.message : "Audit failed.");
     } finally {
@@ -129,307 +40,61 @@ export default function AuditorClient() {
     }
   }
 
+  const visibleProgress = report?.progress?.length ? report.progress : events;
+  const percent = visibleProgress.at(-1)?.progress || 0;
+
   return (
     <main className="min-h-screen bg-zinc-50 px-4 py-6 text-zinc-950 sm:px-6">
-      <div className="mx-auto flex w-full max-w-3xl flex-col gap-5">
-        <header className="border-b border-zinc-200 pb-5">
-          <p className="text-sm font-semibold uppercase tracking-[0.16em] text-sky-700">
-            Remote browser audit
-          </p>
-          <h1 className="mt-2 text-3xl font-semibold sm:text-4xl">Whitelist Form Auditor</h1>
-          <p className="mt-3 text-sm leading-6 text-zinc-600 sm:text-base">
-            Verify whether submitted dummy data actually leaves the browser.
-          </p>
-        </header>
+      <div className="mx-auto grid w-full max-w-6xl gap-5 lg:grid-cols-[1fr_360px]">
+        <div className="flex flex-col gap-5">
+          <header className="border-b border-zinc-200 pb-5">
+            <p className="text-sm font-semibold uppercase tracking-[0.16em] text-sky-700">Evidence-based remote browser audit</p>
+            <h1 className="mt-2 text-3xl font-semibold sm:text-4xl">Whitelist Form Auditor</h1>
+            <p className="mt-3 text-sm leading-6 text-zinc-600 sm:text-base">Determines whether unique dummy data leaves the remote browser in an outbound request after one form submission. It never claims database persistence.</p>
+          </header>
 
-        <section className="rounded border border-zinc-200 bg-white p-4 shadow-sm">
-          <form className="flex flex-col gap-3" onSubmit={runAudit}>
-            <label className="flex flex-col gap-2">
-              <span className="text-sm font-medium text-zinc-700">Website whitelist / waitlist</span>
-              <input
-                value={targetUrl}
-                onBlur={() => {
-                  if (hasInput) setTargetUrl(formattedUrl);
-                }}
-                onChange={(event) => setTargetUrl(event.target.value)}
-                placeholder="example.com/whitelist"
-                className="h-12 rounded border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-sky-600 focus:ring-2 focus:ring-sky-100"
-              />
-            </label>
+          <section className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+            <form className="flex flex-col gap-3" onSubmit={runAudit}>
+              <label className="flex flex-col gap-2"><span className="text-sm font-medium text-zinc-700">Website whitelist / waitlist</span><input value={targetUrl} onBlur={() => targetUrl && setTargetUrl(formattedUrl)} onChange={(event) => setTargetUrl(event.target.value)} placeholder="example.com/whitelist" className="h-12 rounded-xl border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-sky-600 focus:ring-2 focus:ring-sky-100" /></label>
+              {targetUrl ? <div className="rounded-xl border border-sky-100 bg-sky-50 px-3 py-2 text-xs text-sky-900">Auto format: <span className="font-mono">{formattedUrl}</span></div> : null}
+              <button type="submit" disabled={loading || !targetUrl.trim()} className="h-12 rounded-xl bg-zinc-950 px-4 text-sm font-semibold text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-400">{loading ? "AUDITING..." : "RUN AUDIT"}</button>
+            </form>
+            {error ? <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">{error}</div> : null}
+          </section>
 
-            {hasInput ? (
-              <div className="rounded border border-sky-100 bg-sky-50 px-3 py-2 text-xs text-sky-900">
-                Auto format: <span className="font-mono">{formattedUrl}</span>
-              </div>
-            ) : null}
-
-            <button
-              type="submit"
-              disabled={loading || !hasInput}
-              className="h-12 rounded bg-zinc-950 px-4 text-sm font-semibold text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
-            >
-              {loading ? "CHECKING..." : "CHECK"}
-            </button>
-          </form>
-
-          {error ? (
-            <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
-              {error}
-            </div>
-          ) : null}
-        </section>
-
-        {(loading || report) && <ProgressPanel steps={visibleSteps} />}
-
-        {report ? <ResultCard report={report} /> : null}
-
-        <StatusStudy />
+          {(loading || visibleProgress.length > 0) ? <ProgressPanel percent={percent} events={visibleProgress} /> : null}
+          {report ? <ResultCard report={report} /> : null}
+        </div>
+        <StatusCodeLab />
       </div>
     </main>
   );
 }
 
-function ProgressPanel({ steps }: { steps: Array<{ label: string; status: VisibleStepStatus }> }) {
-  const activeStep = steps.find((step) => step.status === "active") || steps.find((step) => step.status === "failed");
+async function readEventStream(body: ReadableStream<Uint8Array>, onEvent: (type: string, data: unknown) => void) {
+  const reader = body.getReader(); const decoder = new TextDecoder(); let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read(); if (done) break; buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split("\n\n"); buffer = chunks.pop() || "";
+    for (const chunk of chunks) {
+      const type = chunk.match(/^event: (.+)$/m)?.[1] || "message"; const data = chunk.match(/^data: (.+)$/m)?.[1];
+      if (data) onEvent(type, JSON.parse(data));
+    }
+  }
+}
 
-  return (
-    <section className="rounded border border-zinc-200 bg-white p-5 shadow-sm">
-      <p className="text-sm font-semibold uppercase tracking-[0.14em] text-zinc-500">Audit Progress</p>
-      <p className="mt-3 text-xl font-semibold text-zinc-950">{activeStep?.label || "Result"}</p>
-      <div className="mt-4 grid gap-2 sm:grid-cols-2">
-        {steps.map((step) => (
-          <div
-            key={step.label}
-            className={`rounded border px-3 py-2 text-sm ${
-              step.status === "done"
-                ? "border-emerald-200 bg-emerald-50 text-emerald-900"
-                : step.status === "failed"
-                  ? "border-amber-200 bg-amber-50 text-amber-900"
-                  : step.status === "active"
-                    ? "border-sky-200 bg-sky-50 text-sky-900"
-                    : "border-zinc-200 bg-zinc-50 text-zinc-500"
-            }`}
-          >
-            {step.label}
-          </div>
-        ))}
-      </div>
-    </section>
-  );
+function ProgressPanel({ percent, events }: { percent: number; events: ProgressEvent[] }) {
+  return <section className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm"><div className="flex items-center justify-between"><p className="text-sm font-semibold uppercase tracking-[0.14em] text-zinc-500">Live backend progress</p><p className="font-mono text-sm font-bold">{percent}%</p></div><div className="mt-4 h-3 overflow-hidden rounded-full bg-zinc-100"><div className="h-full rounded-full bg-sky-600 transition-all duration-500" style={{ width: `${percent}%` }} /></div><div className="mt-4 grid gap-2">{events.map((event, index) => <div key={`${event.progress}-${index}`} className="rounded-xl border border-sky-100 bg-sky-50 px-3 py-2 text-sm text-sky-950"><span className="font-mono font-semibold">{event.progress}</span> {event.label}</div>)}</div></section>;
 }
 
 function ResultCard({ report }: { report: AuditResponse }) {
-  const statusChain = report.statusChain || [];
-  const headline = getHeadline(report);
-
-  return (
-    <section className={`rounded border p-5 shadow-sm ${headline.cardClass}`}>
-      <p className="text-sm font-semibold uppercase tracking-[0.14em]">Result</p>
-      <h2 className="mt-3 text-3xl font-bold">{headline.title}</h2>
-      <p className="mt-2 text-sm leading-6">{headline.description}</p>
-
-      <div className="mt-4 grid gap-3 sm:grid-cols-2">
-        <InfoBox label="Method" value={report.request?.method || "None"} />
-        <InfoBox label="Endpoint domain" value={report.request?.endpointDomain || "None"} />
-        <InfoBox label="Status" value={formatStatusChain(statusChain, report.status)} />
-        <InfoBox label="Matched dummy fields" value={formatFields(report.matchedFields)} />
-      </div>
-
-      <p className="mt-4 rounded border border-zinc-200 bg-white/70 px-3 py-2 text-xs leading-5 text-zinc-700">
-        Verified means the dummy marker was observed in an outgoing server request. It does not prove permanent
-        database storage.
-      </p>
-
-      <DummyData report={report} />
-      <RequestEvidence report={report} />
-      <TechnicalDetails report={report} />
-    </section>
-  );
+  const color = verdictClass(report.verdict);
+  return <section className={`rounded-2xl border p-5 shadow-sm ${color}`}><p className="text-sm font-semibold uppercase tracking-[0.14em]">Verdict</p><h2 className="mt-3 text-3xl font-bold">{report.verdict}</h2><p className="mt-2 text-sm leading-6">{report.message}</p>{report.reason ? <p className="mt-2 text-sm font-medium">Reason: {report.reason}</p> : null}<div className="mt-4 grid gap-3 sm:grid-cols-2"><InfoBox label="Request method" value={report.evidence?.method || "None"} /><InfoBox label="Endpoint domain/path" value={report.evidence ? `${report.evidence.endpointDomain}${report.evidence.endpointPath}` : "None"} /><InfoBox label="Status code" value={String(report.evidence?.statusCode ?? "None")} /><InfoBox label="Response time" value={report.evidence?.responseTimeMs == null ? "None" : `${report.evidence.responseTimeMs} ms`} /></div><DetectedFields report={report} /><DummyData report={report} /><ResponsePreview preview={report.evidence?.sanitizedResponsePreview || "No response preview captured."} /></section>;
 }
-
-function DummyData({ report }: { report: AuditResponse }) {
-  return (
-    <section className="mt-5 rounded border border-zinc-200 bg-white p-4">
-      <h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-zinc-500">Dummy Data Sent / Used</h3>
-      <div className="mt-3 grid gap-3">
-        {FIELD_KEYS.map((field) => {
-          const filled = report.filledFields[field];
-          const matched = report.matchedFields.includes(field);
-          return (
-            <div key={field} className="rounded border border-zinc-200 bg-zinc-50 px-3 py-3">
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <p className="text-xs font-semibold uppercase tracking-[0.12em] text-zinc-500">
-                    {FIELD_LABELS[field]}
-                  </p>
-                  <p className="mt-1 break-all font-mono text-sm text-zinc-950">{report.dummyData[field]}</p>
-                </div>
-                <span className={`w-fit rounded border px-2 py-1 text-xs font-semibold ${dummyBadgeClass(filled, matched)}`}>
-                  {dummyBadgeText(filled, matched)}
-                </span>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-function RequestEvidence({ report }: { report: AuditResponse }) {
-  const statuses = report.statusChain?.length
-    ? report.statusChain.map((item) => item.status)
-    : typeof report.status === "number"
-      ? [report.status]
-      : [];
-
-  return (
-    <section className="mt-4 rounded border border-zinc-200 bg-white p-4">
-      <h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-zinc-500">Evidence</h3>
-      <dl className="mt-3 grid gap-2 text-sm">
-        <InfoRow label="Request endpoint" value={report.request?.endpoint || "None"} />
-        <InfoRow label="Status chain" value={statuses.length ? statuses.join(" -> ") : "No status captured"} />
-        <InfoRow label="Audit ID" value={report.auditId} />
-      </dl>
-    </section>
-  );
-}
-
-function TechnicalDetails({ report }: { report: AuditResponse }) {
-  return (
-    <details className="mt-4 rounded border border-zinc-200 bg-white p-4">
-      <summary className="cursor-pointer text-sm font-semibold uppercase tracking-[0.12em] text-zinc-500">
-        Technical Details
-      </summary>
-      <dl className="mt-3 grid gap-2 text-sm">
-        <InfoRow label="Page loaded" value={yesNo(report.debug.pageLoaded)} />
-        <InfoRow label="Form detected" value={yesNo(report.debug.formDetected)} />
-        <InfoRow label="Fields filled" value={String(report.debug.fieldsFilledCount)} />
-        <InfoRow label="Submit clicked" value={yesNo(report.debug.submitClicked)} />
-        <InfoRow label="Requests observed" value={String(report.debug.requestsObserved)} />
-        <InfoRow label="Analytics ignored" value={String(report.debug.analyticsIgnored)} />
-        <InfoRow label="Matching requests" value={String(report.debug.matchingRequests)} />
-      </dl>
-    </details>
-  );
-}
-
-function StatusStudy() {
-  return (
-    <section className="rounded border border-zinc-200 bg-white p-5 shadow-sm">
-      <p className="text-sm font-semibold uppercase tracking-[0.14em] text-sky-700">Study Page</p>
-      <h2 className="mt-2 text-2xl font-semibold">HTTP Status Code dan Artinya</h2>
-      <p className="mt-2 text-sm leading-6 text-zinc-600">
-        Status code membantu membaca response server. Untuk auditor ini, yang paling penting tetap marker dummy:
-        status 200 saja belum cukup untuk membuktikan data terkirim.
-      </p>
-      <div className="mt-4 grid gap-3">
-        {STUDY_STATUSES.map((status) => {
-          const meaning = getStatusMeaning(status);
-          return (
-            <div key={status} className="rounded border border-zinc-200 bg-zinc-50 px-3 py-3">
-              <div className="flex flex-col gap-1 sm:flex-row sm:items-baseline sm:gap-3">
-                <p className="font-mono text-sm font-bold text-zinc-950">
-                  {status} {meaning.title}
-                </p>
-                <p className="text-sm text-zinc-700">{meaning.meaning}</p>
-              </div>
-              {meaning.note ? <p className="mt-2 text-xs leading-5 text-zinc-500">Note: {meaning.note}</p> : null}
-            </div>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-function InfoBox({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded border border-zinc-200 bg-white/75 px-3 py-2">
-      <dt className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">{label}</dt>
-      <dd className="mt-1 break-all font-medium text-zinc-950">{value || "None"}</dd>
-    </div>
-  );
-}
-
-function InfoRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="grid gap-1 rounded border border-zinc-200 bg-zinc-50 px-3 py-2 sm:grid-cols-[150px_1fr]">
-      <dt className="text-xs font-medium text-zinc-500">{label}</dt>
-      <dd className="break-all font-mono text-xs text-zinc-950">{value}</dd>
-    </div>
-  );
-}
-
-function getHeadline(report: AuditResponse) {
-  if (report.verdict === "YES") {
-    return {
-      title: "YES - DATA SENT TO SERVER",
-      description: "A unique dummy marker was detected in a non-analytics server request.",
-      cardClass: "border-emerald-200 bg-emerald-50 text-emerald-950",
-    };
-  }
-
-  if (report.verdict === "NO_EVIDENCE") {
-    return {
-      title: "NO EVIDENCE",
-      description: "No request containing the generated dummy markers was detected.",
-      cardClass: "border-red-200 bg-red-50 text-red-950",
-    };
-  }
-
-  return {
-    title: "COULDN'T VERIFY",
-    description: report.reason || "Browser automation could not verify this page.",
-    cardClass: "border-amber-200 bg-amber-50 text-amber-950",
-  };
-}
-
-function normalizeUrl(value: string) {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return "";
-  }
-  if (/^https?:\/\//i.test(trimmed)) {
-    return trimmed;
-  }
-  return `https://${trimmed}`;
-}
-
-function formatStatusChain(statusChain: StatusChainItem[], fallbackStatus?: number | null) {
-  if (statusChain.length > 0) {
-    return statusChain.map((item) => item.status).join(" -> ");
-  }
-  return typeof fallbackStatus === "number" ? String(fallbackStatus) : "None";
-}
-
-function formatFields(fields: FieldKey[]) {
-  if (fields.length === 0) {
-    return "None";
-  }
-  return fields.map((field) => FIELD_LABELS[field]).join(", ");
-}
-
-function dummyBadgeText(filled: boolean, matched: boolean) {
-  if (matched) {
-    return "FILLED + MATCHED";
-  }
-  if (filled) {
-    return "FILLED ONLY";
-  }
-  return "NOT USED";
-}
-
-function dummyBadgeClass(filled: boolean, matched: boolean) {
-  if (matched) {
-    return "border-emerald-200 bg-emerald-100 text-emerald-900";
-  }
-  if (filled) {
-    return "border-sky-200 bg-sky-100 text-sky-900";
-  }
-  return "border-zinc-200 bg-white text-zinc-500";
-}
-
-function yesNo(value: boolean) {
-  return value ? "Yes" : "No";
-}
+function DetectedFields({ report }: { report: AuditResponse }) { return <section className="mt-5 rounded-xl border border-zinc-200 bg-white p-4"><h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-zinc-500">Detected required fields</h3><div className="mt-3 flex flex-wrap gap-2">{report.detectedFields.length ? report.detectedFields.map((field) => <span key={`${field.kind}-${field.label}`} className="rounded-full border border-zinc-200 bg-zinc-50 px-3 py-1 text-xs font-semibold">{FIELD_LABELS[field.kind]} · required</span>) : <span className="text-sm text-zinc-500">None</span>}</div></section>; }
+function DummyData({ report }: { report: AuditResponse }) { return <section className="mt-4 rounded-xl border border-zinc-200 bg-white p-4"><h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-zinc-500">Exact dummy data and marker matches</h3><div className="mt-3 grid gap-2">{FIELD_KEYS.map((field) => <div key={field} className="grid gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 sm:grid-cols-[130px_1fr_110px]"><span className="text-xs font-semibold uppercase tracking-[0.12em] text-zinc-500">{FIELD_LABELS[field]}</span><span className="break-all font-mono text-xs">{report.dummyData[field]}</span><span className={`rounded-full px-2 py-1 text-center text-[11px] font-bold ${report.evidence?.markersFound?.[field] ? "bg-emerald-100 text-emerald-800" : "bg-zinc-200 text-zinc-600"}`}>{report.evidence?.markersFound?.[field] ? "FOUND" : "NOT FOUND"}</span></div>)}</div></section>; }
+function ResponsePreview({ preview }: { preview: string }) { return <section className="mt-4 rounded-xl border border-zinc-200 bg-white p-4"><h3 className="text-sm font-semibold uppercase tracking-[0.12em] text-zinc-500">Sanitized response preview</h3><pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-950 p-3 text-xs text-zinc-50">{preview}</pre></section>; }
+function StatusCodeLab() { return <aside className="h-fit rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm lg:sticky lg:top-6"><p className="text-sm font-semibold uppercase tracking-[0.14em] text-sky-700">Status Code Lab</p><h2 className="mt-2 text-2xl font-semibold">What HTTP statuses mean here</h2><div className="mt-4 grid gap-3">{STATUS_CODE_LAB.map((item) => <article key={item.code} className="rounded-xl border border-zinc-200 bg-zinc-50 p-3"><p className="font-mono text-sm font-bold">{item.code} {item.title}</p><p className="mt-2 text-xs leading-5"><strong>General:</strong> {item.generalMeaning}</p><p className="mt-2 text-xs leading-5"><strong>Auditor:</strong> {item.auditorMeaning}</p><p className="mt-2 text-xs leading-5"><strong>Does not prove:</strong> {item.doesNotProve}</p></article>)}</div></aside>; }
+function InfoBox({ label, value }: { label: string; value: string }) { return <div className="rounded-xl border border-zinc-200 bg-white/75 px-3 py-2"><dt className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">{label}</dt><dd className="mt-1 break-all font-medium text-zinc-950">{value}</dd></div>; }
+function verdictClass(verdict: Verdict) { if (verdict === "CONFIRMED_SENT") return "border-emerald-200 bg-emerald-50 text-emerald-950"; if (verdict === "SENT_BUT_REJECTED") return "border-amber-200 bg-amber-50 text-amber-950"; if (verdict === "NO_SUBMISSION_DETECTED") return "border-red-200 bg-red-50 text-red-950"; return "border-zinc-300 bg-zinc-100 text-zinc-950"; }
+function normalizeUrl(value: string) { const trimmed = value.trim(); if (!trimmed) return ""; return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`; }
