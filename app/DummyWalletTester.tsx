@@ -88,9 +88,9 @@ export default function DummyWalletTester() {
           <h1 className="mt-2 text-3xl font-semibold tracking-tight text-white sm:text-4xl">
             Whitelist Form Auditor
           </h1>
-          <p className="mt-3 max-w-xl text-sm leading-6 text-zinc-400 sm:text-base">
-            Paste halaman waitlist, whitelist, atau airdrop. Auditor mengisi data dummy dan mengecek apakah data
-            benar-benar keluar menuju server.
+          <p className="editorial-description mt-4 max-w-xl text-zinc-400">
+            Tempel halaman waitlist, whitelist, atau airdrop. Auditor akan mengisi data dummy lalu memeriksa apakah
+            informasi tersebut benar-benar dikirim menuju server.
           </p>
         </header>
 
@@ -116,9 +116,11 @@ export default function DummyWalletTester() {
               <button
                 type="submit"
                 disabled={loading || !url.trim()}
-                className="h-12 shrink-0 rounded-xl bg-cyan-400 px-5 text-sm font-semibold text-zinc-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400"
+                aria-label={loading ? "Sedang menganalisis halaman" : "Analisis dan kirim form"}
+                title={loading ? "Sedang menganalisis..." : "Analisis dan kirim"}
+                className="flex h-12 w-full shrink-0 items-center justify-center rounded-xl bg-cyan-400 text-2xl text-zinc-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-400 sm:w-14"
               >
-                {loading ? "Menganalisis..." : "Analyze & submit"}
+                <span aria-hidden="true" className={loading ? "animate-pulse" : ""}>🔎</span>
               </button>
             </div>
           </form>
