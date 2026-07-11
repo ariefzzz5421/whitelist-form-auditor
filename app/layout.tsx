@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "YES / NO Whitelist Form Detector",
-  description: "Paste a whitelist or waitlist URL and detect whether dummy data is sent to a server.",
+  title: "Whitelist Form Auditor",
+  description: "Verify whether dummy whitelist data is sent from a website form to a server.",
 };
 
 export default function RootLayout({
@@ -12,7 +12,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="id">
       <body>{children}</body>
     </html>
   );
