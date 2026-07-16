@@ -13,7 +13,6 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "cheerio": "^1.2.0",
     "next": "^16.2.10",
     "playwright-core": "^1.61.1",
     "react": "^19.2.7",

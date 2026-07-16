@@ -1,5 +1,5 @@
-import { redirect } from "next/navigation";
+import DummyWalletTester from "./DummyWalletTester";
 
 export default function Home() {
-  redirect("/tools/whitelist-auditor");
+  return <DummyWalletTester />;
 }
