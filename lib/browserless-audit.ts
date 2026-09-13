@@ -24,6 +24,7 @@ export interface AuditResult {
     endpoint: string;
     domain: string;
     status: number | null;
+    accepted: boolean | null;
   };
   debug: {
     pageLoaded: boolean;
@@ -63,6 +64,7 @@ interface Match {
   domain: string;
   matchedFields: FieldKey[];
   status: number | null;
+  observedAt: number;
 }
 
 const FIELD_KEYS: FieldKey[] = ["wallet", "xHandle", "email", "username"];
@@ -100,12 +102,7 @@ export async function runBrowserlessAudit(targetUrl: URL): Promise<AuditResult> 
 
   const token = process.env.BROWSERLESS_TOKEN?.trim();
   if (!token) {
-    return {
-      ...base,
-      verdict: "INCONCLUSIVE",
-      message: "Browserless belum dikonfigurasi.",
-      reason: "BROWSERLESS_TOKEN tidak ditemukan di server.",
-    };
+    return inconclusive(base, "Pemeriksaan sedang tidak tersedia. Coba lagi beberapa saat lagi.");
   }
 
   let browser: Browser | null = null;
@@ -130,6 +127,7 @@ export async function runBrowserlessAudit(targetUrl: URL): Promise<AuditResult> 
         domain: safeDomain(request.url()),
         matchedFields,
         status: null,
+        observedAt: Date.now(),
       };
       matches.push(match);
       matchByRequest.set(request, match);
@@ -148,65 +146,117 @@ export async function runBrowserlessAudit(targetUrl: URL): Promise<AuditResult> 
       }
     });
 
-    await page.goto(targetUrl.toString(), {
-      waitUntil: "domcontentloaded",
-      timeout: 15_000,
-    });
+    const navigationFailure = await loadTargetPage(page, targetUrl);
+    if (navigationFailure) {
+      console.warn(`[audit:${auditId}] navigation failed: ${navigationFailure.technical}`);
+      return inconclusive(base, navigationFailure.userMessage);
+    }
     debug.pageLoaded = true;
-    await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
+
+    await page.waitForLoadState("networkidle", { timeout: 4_000 }).catch(() => undefined);
 
     let fillResult = await fillDummyFields(page.frames(), dummyData);
     if (fillResult.formDetected && !fillResult.filledFields.length) {
-      await page.waitForTimeout(1_200);
+      await page.waitForTimeout(900);
       fillResult = await fillDummyFields(page.frames(), dummyData);
     }
     base.filledFields = fillResult.filledFields;
     debug.formDetected = fillResult.formDetected;
 
     if (!fillResult.formDetected) {
-      return inconclusive(base, "Tidak ditemukan field wallet, X, email, atau username yang bisa diisi.");
+      return inconclusive(
+        base,
+        "Form yang bisa diuji tidak ditemukan. Halaman mungkin memakai langkah khusus, CAPTCHA, atau wallet connection.",
+      );
     }
     if (!fillResult.filledFields.length) {
-      return inconclusive(base, "Form terdeteksi, tetapi field dummy tidak berhasil diisi.");
+      return inconclusive(base, "Form ditemukan, tetapi data uji tidak dapat dimasukkan dengan aman.");
     }
 
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(250);
     const submitted = await clickSafeSubmit(page.frames(), fillResult.filledTargets);
     debug.submitClicked = submitted.clicked;
 
     if (!submitted.clicked) {
-      return inconclusive(base, submitted.reason || "Tombol submit yang aman tidak ditemukan.");
+      return inconclusive(
+        base,
+        submitted.reason || "Form tidak dapat dikirim otomatis dengan aman.",
+      );
     }
 
-    await page.waitForTimeout(8_000);
-    const winner = pickBestMatch(matches);
+    const winner = await waitForBestMatch(page, matches, 8_000);
     if (!winner) {
       return {
         ...base,
         verdict: "NO_EVIDENCE",
-        message: "Tidak ada request yang membawa data dummy.",
+        message: "Tidak ditemukan bukti bahwa data uji dikirim dari halaman ini.",
+        reason:
+          "Form berhasil diisi dan tombol kirim ditekan, tetapi tidak ada request keluar yang membawa data uji.",
       };
     }
 
     base.matchedFields = winner.matchedFields;
+    const accepted = responseAccepted(winner.status);
     return {
       ...base,
       verdict: "VERIFIED",
-      message: "Data dummy benar-benar terlihat pada request keluar ke server.",
+      message: buildVerifiedMessage(winner.status),
+      reason: buildVerifiedReason(winner.status),
       request: {
         method: winner.method,
         endpoint: winner.endpoint,
         domain: winner.domain,
         status: winner.status,
+        accepted,
       },
     };
   } catch (error) {
-    return inconclusive(
-      base,
-      error instanceof Error ? sanitizeError(error.message) : "Browser automation gagal.",
-    );
+    const technical = error instanceof Error ? sanitizeError(error.message) : "Unknown browser automation error";
+    console.error(`[audit:${auditId}] ${technical}`);
+    return inconclusive(base, friendlyFailureMessage(technical));
   } finally {
     await browser?.close().catch(() => undefined);
+  }
+}
+
+async function loadTargetPage(page: import("playwright-core").Page, targetUrl: URL) {
+  try {
+    const response = await page.goto(targetUrl.toString(), {
+      waitUntil: "domcontentloaded",
+      timeout: 22_000,
+    });
+
+    const status = response?.status() ?? null;
+    if (status !== null && status >= 400) {
+      return {
+        userMessage:
+          "Halaman target menolak atau gagal dimuat oleh browser pemeriksa. Form belum bisa diuji, jadi belum ada kesimpulan.",
+        technical: `HTTP ${status}`,
+      };
+    }
+
+    return null;
+  } catch (error) {
+    const technical = error instanceof Error ? sanitizeError(error.message) : "Navigation failed";
+
+    // Some sites throw during navigation after still rendering a usable document.
+    // Only continue if a real visible page body exists and the page moved to the target origin.
+    const hasUsableBody = await page
+      .locator("body")
+      .evaluate((body) => {
+        const text = body.innerText.trim();
+        const rect = body.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && text.length > 20;
+      })
+      .catch(() => false);
+
+    const currentHost = safeDomain(page.url());
+    if (hasUsableBody && currentHost === targetUrl.hostname.toLowerCase()) return null;
+
+    return {
+      userMessage: friendlyFailureMessage(technical),
+      technical,
+    };
   }
 }
 
@@ -357,11 +407,15 @@ async function clickSafeSubmit(frames: Frame[], filledTargets: FilledTarget[]) {
     if (clicked) return { clicked: true as const };
   }
 
-  return { clicked: false as const, reason: "Tombol submit tidak ditemukan, diblokir, atau membutuhkan wallet/signature." };
+  return {
+    clicked: false as const,
+    reason: "Form membutuhkan langkah tambahan atau tombol kirim yang aman tidak ditemukan.",
+  };
 }
 
 async function clickBestControl(controls: Locator, safe: RegExp, unsafe: RegExp) {
-  const items = await controls.evaluateAll((elements) =>
+  const items = await controls
+    .evaluateAll((elements) =>
       elements.map((element, index) => {
         const input = element as HTMLInputElement;
         const rect = element.getBoundingClientRect();
@@ -379,16 +433,26 @@ async function clickBestControl(controls: Locator, safe: RegExp, unsafe: RegExp)
           visible: rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden",
         };
       }),
-    ).catch(() => [] as Array<{ index: number; text: string; type: string; disabled: boolean; visible: boolean }>);
+    )
+    .catch(
+      () => [] as Array<{ index: number; text: string; type: string; disabled: boolean; visible: boolean }>,
+    );
 
   const candidate = items
     .filter((item) => item.visible && !item.disabled && !unsafe.test(item.text))
-    .map((item) => ({ ...item, score: (safe.test(item.text) ? 20 : 0) + (item.type === "submit" ? 10 : 0) }))
+    .map((item) => ({
+      ...item,
+      score: (safe.test(item.text) ? 20 : 0) + (item.type === "submit" ? 10 : 0),
+    }))
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score)[0];
 
   if (!candidate) return false;
-  return controls.nth(candidate.index).click({ timeout: 5_000 }).then(() => true).catch(() => false);
+  return controls
+    .nth(candidate.index)
+    .click({ timeout: 5_000 })
+    .then(() => true)
+    .catch(() => false);
 }
 
 function detectDummyValues(request: PlaywrightRequest, dummyData: Record<FieldKey, string>) {
@@ -402,7 +466,9 @@ function detectDummyValues(request: PlaywrightRequest, dummyData: Record<FieldKe
   for (const part of parts) {
     variants.add(part);
     variants.add(part.replace(/\+/g, " "));
-    try { variants.add(decodeURIComponent(part)); } catch {}
+    try {
+      variants.add(decodeURIComponent(part));
+    } catch {}
   }
   const text = Array.from(variants).join("\n").toLowerCase();
   return FIELD_KEYS.filter((key) => {
@@ -411,8 +477,78 @@ function detectDummyValues(request: PlaywrightRequest, dummyData: Record<FieldKe
   });
 }
 
+async function waitForBestMatch(
+  page: import("playwright-core").Page,
+  matches: Match[],
+  timeoutMs: number,
+) {
+  const startedAt = Date.now();
+  let firstMatchAt: number | null = null;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (matches.length > 0 && firstMatchAt === null) firstMatchAt = Date.now();
+
+    const winner = pickBestMatch(matches);
+    if (winner?.status !== null) return winner;
+
+    // Once a matching request is seen, give its response a short grace period.
+    if (winner && firstMatchAt !== null && Date.now() - firstMatchAt > 1_500) return winner;
+
+    await page.waitForTimeout(200);
+  }
+
+  return pickBestMatch(matches);
+}
+
 function pickBestMatch(matches: Match[]) {
-  return matches.sort((a, b) => b.matchedFields.length - a.matchedFields.length)[0];
+  return [...matches].sort((a, b) => scoreMatch(b) - scoreMatch(a))[0];
+}
+
+function scoreMatch(match: Match) {
+  const statusScore = match.status !== null && match.status >= 200 && match.status < 400 ? 20 : 0;
+  const methodScore = match.method === "POST" || match.method === "PUT" || match.method === "PATCH" ? 10 : 0;
+  return match.matchedFields.length * 100 + statusScore + methodScore - match.observedAt / 1e15;
+}
+
+function responseAccepted(status: number | null) {
+  if (status === null) return null;
+  return status >= 200 && status < 400;
+}
+
+function buildVerifiedMessage(status: number | null) {
+  if (status === null) return "Data uji terlihat dikirim dari halaman ini.";
+  if (status >= 200 && status < 400) return "Data uji dikirim dan server memberikan respons berhasil.";
+  return "Data uji dikirim, tetapi server memberikan respons gagal.";
+}
+
+function buildVerifiedReason(status: number | null) {
+  if (status === null) {
+    return "Data unik dari audit ditemukan pada request keluar. Respons akhir server tidak sempat dikonfirmasi.";
+  }
+  if (status >= 200 && status < 400) {
+    return `Data unik dari audit ditemukan pada request keluar dan server merespons HTTP ${status}.`;
+  }
+  return `Data unik dari audit memang keluar dari browser, tetapi server merespons HTTP ${status}. Pengiriman terjadi, namun pendaftaran mungkin tidak berhasil.`;
+}
+
+function friendlyFailureMessage(message: string) {
+  const lower = message.toLowerCase();
+  if (lower.includes("err_http_response_code_failure")) {
+    return "Halaman target menolak atau gagal dimuat oleh browser pemeriksa. Form belum bisa diuji, jadi belum ada kesimpulan.";
+  }
+  if (lower.includes("timeout") || lower.includes("timed out")) {
+    return "Halaman target terlalu lama merespons. Coba ulang beberapa saat lagi.";
+  }
+  if (lower.includes("err_name_not_resolved") || lower.includes("dns")) {
+    return "Alamat website tidak dapat ditemukan. Periksa URL lalu coba lagi.";
+  }
+  if (lower.includes("err_connection_refused") || lower.includes("err_connection_closed")) {
+    return "Website target tidak menerima koneksi dari browser pemeriksa. Belum ada kesimpulan tentang formnya.";
+  }
+  if (lower.includes("captcha") || lower.includes("cloudflare") || lower.includes("access denied")) {
+    return "Website target membatasi browser otomatis. Form belum dapat diuji dengan aman.";
+  }
+  return "Pemeriksaan tidak dapat diselesaikan pada website ini. Tidak ada kesimpulan yang dibuat.";
 }
 
 function isAnalytics(url: string) {
@@ -421,7 +557,11 @@ function isAnalytics(url: string) {
 }
 
 function safeDomain(url: string) {
-  try { return new URL(url).hostname.toLowerCase(); } catch { return ""; }
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
 }
 
 function buildDummyData(auditId: string): Record<FieldKey, string> {
@@ -437,7 +577,12 @@ function inconclusive(
   base: Omit<AuditResult, "verdict" | "message">,
   reason: string,
 ): AuditResult {
-  return { ...base, verdict: "INCONCLUSIVE", message: "Audit tidak dapat diselesaikan.", reason };
+  return {
+    ...base,
+    verdict: "INCONCLUSIVE",
+    message: "Pemeriksaan belum bisa diselesaikan.",
+    reason,
+  };
 }
 
 function sanitizeError(message: string) {
